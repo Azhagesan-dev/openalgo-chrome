@@ -3,14 +3,15 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>OpenAlgo Trading Controls</title>
+  <title>OpenAlgo Options Scalper</title>
   <link href="css/styles.css" rel="stylesheet" type="text/css" />
   <style>
     body {
-      width: 280px;
+      width: 380px;
       padding: 1.5rem;
       text-align: center;
-      background-color: var(--base-100);
+      background-color: #1a1a2e;
+      color: #eee;
     }
     .logo-container {
       margin-bottom: 1rem;
@@ -20,37 +21,53 @@
     .logo {
       font-size: 1.5rem;
       font-weight: bold;
-      background: linear-gradient(135deg, var(--primary) 0%, var(--secondary) 100%);
+      background: linear-gradient(135deg, #5c6bc0 0%, #00e676 100%);
       -webkit-background-clip: text;
       background-clip: text;
       -webkit-text-fill-color: transparent;
       margin-bottom: 0.5rem;
     }
+    .version {
+      font-size: 0.75rem;
+      color: #666;
+    }
     .status-container {
-      background-color: var(--base-200);
+      background-color: #2a2a4a;
       padding: 1rem;
       border-radius: 0.75rem;
       margin: 1rem 0;
-      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.05);
     }
     .status-text {
       margin: 0.5rem 0;
       font-size: 0.875rem;
-      color: var(--base-content);
+      color: #aaa;
     }
     .success {
-      color: var(--success);
+      color: #00e676;
       font-weight: 600;
     }
     .help-text {
       font-size: 0.75rem;
-      color: var(--base-content);
-      opacity: 0.8;
+      color: #888;
       margin-top: 1rem;
       line-height: 1.4;
     }
-    .badge {
-      margin-bottom: 0.5rem;
+    .feature-badge {
+      display: inline-block;
+      background: #2a2a4a;
+      color: #5c6bc0;
+      padding: 0.25rem 0.75rem;
+      border-radius: 1rem;
+      font-size: 0.7rem;
+      font-weight: 600;
+      margin: 0.25rem;
+    }
+    .badge-row {
+      display: flex;
+      justify-content: center;
+      flex-wrap: wrap;
+      gap: 0.5rem;
+      margin-top: 1rem;
     }
   </style>
 </head>
@@ -58,26 +75,29 @@
   <div class="card">
     <div class="card-body p-2">
       <div class="logo-container">
-        <h1 class="logo">OpenAlgo</h1>
+        <div>
+          <h1 class="logo">OpenAlgo Scalper</h1>
+          <span class="version">v2.0</span>
+        </div>
       </div>
-      
-      <div class="badge badge-primary">Trading Controls</div>
       
       <div class="status-container">
         <div class="status-text success">
-          Trading buttons are ready to use
+          Options Scalping UI is ready
+        </div>
+        <div class="status-text">
+          Trading controls are injected on all pages
         </div>
       </div>
       
       <p class="help-text">
-        Use the vertical dots menu (⋮) on the trading buttons to configure settings
+        Use the ⋮ menu on the floating panel to configure settings
       </p>
       
-      <div class="flex justify-center gap-2 mt-2">
-        <span class="badge badge-outline" style="background-color: var(--le-color); color: white;">LE</span>
-        <span class="badge badge-outline" style="background-color: var(--lx-color); color: var(--neutral);">LX</span>
-        <span class="badge badge-outline" style="background-color: var(--se-color); color: white;">SE</span>
-        <span class="badge badge-outline" style="background-color: var(--sx-color); color: white;">SX</span>
+      <div class="badge-row">
+        <span class="feature-badge">Options Scalping</span>
+        <span class="feature-badge">Quick Orders</span>
+        <span class="feature-badge">Strike Chain</span>
       </div>
     </div>
   </div>

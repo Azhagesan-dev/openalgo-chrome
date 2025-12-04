@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "OpenAlgo",
-  "version": "1.0",
-  "description": "OpenAlgo Chrome Extension",
+  "name": "OpenAlgo Options Scalper",
+  "version": "2.0",
+  "description": "Options Scalping Extension for OpenAlgo with quick order placement",
   "homepage_url": "https://openalgo.in",
   "action": {
     "default_popup": "popup.html",
