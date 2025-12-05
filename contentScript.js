@@ -1,4 +1,4 @@
-// OpenAlgo Options Scalping Extension v2.2
+// OpenAlgo Options Scalping Extension v2.3
 // Global state
 let state = {
   action: 'BUY',
@@ -6,6 +6,7 @@ let state = {
   selectedExpiry: '',
   selectedOffset: 'ATM',
   selectedStrike: 0,
+  selectedSymbol: '', // Full option symbol for API calls
   strikeMode: 'moneyness', // 'moneyness' or 'strike'
   extendLevel: 5, // Current ITM/OTM level (5 = ITM5/OTM5)
   useMoneyness: true,
@@ -17,11 +18,13 @@ let state = {
   underlyingPrevClose: 0,
   optionLtp: 0,
   optionPrevClose: 0,
+  margin: 0, // Required margin for current order
   theme: 'dark',
   refreshMode: 'auto',
   refreshIntervalSec: 5,
+  rateLimit: 100, // Delay between API calls in ms
   refreshAreas: { funds: true, underlying: true, selectedStrike: true },
-  loading: { funds: false, underlying: false, strikes: false }
+  loading: { funds: false, underlying: false, strikes: false, margin: false }
 };
 
 let expiryList = [];
@@ -48,10 +51,11 @@ async function init() {
 // Load settings from chrome storage
 function loadSettings() {
   return new Promise((resolve) => {
-    chrome.storage.sync.get(['hostUrl', 'apiKey', 'symbols', 'activeSymbolId', 'uiMode', 'symbol', 'exchange', 'product', 'quantity', 'theme', 'refreshMode', 'refreshIntervalSec', 'refreshAreas', 'strikeMode'], (data) => {
+    chrome.storage.sync.get(['hostUrl', 'apiKey', 'symbols', 'activeSymbolId', 'uiMode', 'symbol', 'exchange', 'product', 'quantity', 'theme', 'refreshMode', 'refreshIntervalSec', 'refreshAreas', 'strikeMode', 'rateLimit'], (data) => {
       state.theme = data.theme || 'dark';
       state.refreshMode = data.refreshMode || 'auto';
       state.refreshIntervalSec = data.refreshIntervalSec || 5;
+      state.rateLimit = data.rateLimit || 100;
       state.refreshAreas = data.refreshAreas || { funds: true, underlying: true, selectedStrike: true };
       state.strikeMode = data.strikeMode || 'moneyness';
       state.useMoneyness = state.strikeMode === 'moneyness';
@@ -131,6 +135,46 @@ async function apiCall(endpoint, data) {
   }
 }
 
+// Rate limiter - delays between API calls
+let lastApiCallTime = 0;
+async function rateLimitedApiCall(endpoint, data) {
+  const now = Date.now();
+  const elapsed = now - lastApiCallTime;
+  if (elapsed < state.rateLimit) {
+    await new Promise(r => setTimeout(r, state.rateLimit - elapsed));
+  }
+  lastApiCallTime = Date.now();
+  return apiCall(endpoint, data);
+}
+
+// Fetch margin for current order
+async function fetchMargin() {
+  const symbol = getActiveSymbol();
+  if (!symbol || !state.selectedSymbol) return;
+
+  const price = state.orderType === 'MARKET' ? state.optionLtp : state.price;
+  if (!price) return;
+
+  state.loading.margin = true;
+  const result = await rateLimitedApiCall('/api/v1/margin', {
+    positions: [{
+      symbol: state.selectedSymbol,
+      exchange: symbol.optionExchange,
+      action: state.action,
+      product: symbol.product || 'MIS',
+      pricetype: state.orderType === 'SL-M' ? 'SL-M' : (state.orderType === 'SL' ? 'SL' : (state.orderType === 'LIMIT' ? 'LIMIT' : 'MARKET')),
+      quantity: String(state.lots * state.lotSize),
+      price: String(price)
+    }]
+  });
+
+  if (result.status === 'success' && result.data) {
+    state.margin = result.data.total_margin_required || 0;
+    updateOrderButton();
+  }
+  state.loading.margin = false;
+}
+
 // Fetch quotes for underlying
 async function fetchUnderlyingQuote() {
   const symbol = getActiveSymbol();
@@ -167,7 +211,7 @@ async function fetchFunds() {
 async function fetchExpiry() {
   const symbol = getActiveSymbol();
   if (!symbol) return;
-  const result = await apiCall('/api/v1/expiry', {
+  const result = await rateLimitedApiCall('/api/v1/expiry', {
     symbol: symbol.symbol,
     exchange: symbol.optionExchange,
     instrumenttype: 'options'
@@ -178,6 +222,10 @@ async function fetchExpiry() {
       state.selectedExpiry = expiryList[0].replace(/-/g, '').toUpperCase();
     }
     updateExpirySlider();
+    // Auto-fetch strike chain after expiry is loaded
+    if (state.selectedExpiry) {
+      await fetchStrikeChain();
+    }
   }
 }
 
@@ -381,25 +429,57 @@ function manualRefresh() {
 }
 
 // Refresh only the selected strike's LTP and update price if MARKET
+// In moneyness mode: first get latest strike from optionsymbol API, then quotes
 async function refreshSelectedStrike() {
-  const selected = strikeChain.find(s => s.offset === state.selectedOffset);
-  if (!selected) return;
+  const symbol = getActiveSymbol();
+  if (!symbol) return;
 
   state.loading.strikes = true;
   showLoadingIndicator('strikes');
 
-  const result = await apiCall('/api/v1/quotes', { symbol: selected.symbol, exchange: selected.exchange });
-  if (result.status === 'success' && result.data) {
-    selected.ltp = result.data.ltp || 0;
-    selected.prevClose = result.data.prev_close || 0;
-    state.optionLtp = selected.ltp;
-    state.optionPrevClose = selected.prevClose;
+  // In moneyness mode, get latest strike from optionsymbol API first
+  if (state.strikeMode === 'moneyness' && state.selectedExpiry) {
+    const symbolResult = await rateLimitedApiCall('/api/v1/optionsymbol', {
+      strategy: 'Chrome',
+      underlying: symbol.symbol,
+      exchange: symbol.exchange,
+      expiry_date: state.selectedExpiry,
+      offset: state.selectedOffset,
+      option_type: state.optionType
+    });
 
-    // Update price element if MARKET order
-    if (state.orderType === 'MARKET') {
-      updatePriceDisplay();
+    if (symbolResult.status === 'success') {
+      const strikeMatch = symbolResult.symbol.match(/^[A-Z]+(?:\d{2}[A-Z]{3}\d{2})(\d+)(?=CE$|PE$)/);
+      state.selectedStrike = strikeMatch ? parseInt(strikeMatch[1]) : 0;
+      state.selectedSymbol = symbolResult.symbol;
+      state.lotSize = symbolResult.lotsize || state.lotSize;
+
+      // Update strike in chain
+      const chainItem = strikeChain.find(s => s.offset === state.selectedOffset);
+      if (chainItem) {
+        chainItem.symbol = symbolResult.symbol;
+        chainItem.strike = state.selectedStrike;
+      }
     }
-    updateStrikeDropdown();
+  }
+
+  // Now fetch quote for the selected strike
+  const selected = strikeChain.find(s => s.offset === state.selectedOffset);
+  if (selected) {
+    const result = await rateLimitedApiCall('/api/v1/quotes', { symbol: selected.symbol, exchange: selected.exchange });
+    if (result.status === 'success' && result.data) {
+      selected.ltp = result.data.ltp || 0;
+      selected.prevClose = result.data.prev_close || 0;
+      state.optionLtp = selected.ltp;
+      state.optionPrevClose = selected.prevClose;
+
+      // Update price element if MARKET order
+      if (state.orderType === 'MARKET') {
+        updatePriceDisplay();
+      }
+      updateStrikeDropdown();
+      updateStrikeButton();
+    }
   }
 
   state.loading.strikes = false;
@@ -444,7 +524,32 @@ function updateExpirySlider() {
     btn.addEventListener('click', async () => {
       state.selectedExpiry = btn.dataset.expiry;
       updateExpirySlider();
+
+      // Show loading on multiple elements
+      const strikeBtn = document.getElementById('oa-strike-btn');
+      const priceInput = document.getElementById('oa-price');
+      const orderBtn = document.getElementById('oa-order-btn');
+      const strikeCol = document.getElementById('oa-strike-col');
+      const ltpCol = document.getElementById('oa-ltp-col');
+
+      strikeBtn?.classList.add('oa-loading');
+      priceInput?.classList.add('oa-loading');
+      orderBtn?.classList.add('oa-loading');
+      strikeCol?.classList.add('oa-loading');
+
       await fetchStrikeChain();
+
+      // Now loading on LTP column while quotes fetch
+      strikeCol?.classList.remove('oa-loading');
+      ltpCol?.classList.add('oa-loading');
+
+      await fetchStrikeLTPs();
+
+      // Remove all loading
+      strikeBtn?.classList.remove('oa-loading');
+      priceInput?.classList.remove('oa-loading');
+      orderBtn?.classList.remove('oa-loading');
+      ltpCol?.classList.remove('oa-loading');
     });
   });
 }
@@ -476,9 +581,12 @@ function updateStrikeDropdown() {
     row.addEventListener('click', () => {
       state.selectedOffset = row.dataset.offset;
       state.selectedStrike = parseInt(row.dataset.strike);
+      state.selectedSymbol = row.dataset.symbol; // Save full symbol for API calls
       updateSelectedOptionLTP();
       updateStrikeButton();
       toggleStrikeDropdown(false);
+      // Fetch margin for new selection
+      fetchMargin();
     });
   });
 }
@@ -487,7 +595,8 @@ function updateStrikeButton() {
   const btn = document.getElementById('oa-strike-btn');
   if (!btn) return;
   if (state.strikeMode === 'moneyness') {
-    btn.textContent = `${state.selectedOffset} ${state.selectedStrike}`;
+    // Show only moneyness (ATM, ITM1, etc.) in moneyness mode
+    btn.textContent = state.selectedOffset;
   } else {
     btn.textContent = `${state.selectedStrike} ${state.optionType}`;
   }
@@ -506,13 +615,15 @@ function updatePriceDisplay() {
     el.value = state.price.toFixed(2);
   }
   updateOrderButton();
+  fetchMargin(); // Fetch margin when price changes
 }
 
 function updateOrderButton() {
   const btn = document.getElementById('oa-order-btn');
   if (!btn) return;
   const price = state.orderType === 'MARKET' ? state.optionLtp : state.price;
-  btn.textContent = `${state.action} @ ${formatNumber(price)}`;
+  const marginText = state.margin > 0 ? ` [₹${formatNumber(state.margin, 0)}]` : '';
+  btn.textContent = `${state.action} @ ${formatNumber(price)}${marginText}`;
   btn.className = `oa-order-btn ${state.action === 'BUY' ? 'buy' : 'sell'}`;
 }
 
@@ -525,7 +636,7 @@ function toggleStrikeDropdown(show) {
 function injectUI() {
   const container = document.createElement('div');
   container.id = 'openalgo-controls';
-  container.className = 'oa-container';
+  container.className = settings.uiMode === 'scalping' ? 'oa-container oa-scalping' : 'oa-container oa-quick';
 
   if (settings.uiMode === 'scalping') {
     container.innerHTML = buildScalpingUI();
@@ -543,6 +654,8 @@ function buildScalpingUI() {
   const symbol = getActiveSymbol();
   const themeIcon = state.theme === 'dark' ? '☀️' : '🌙';
   const modeLabel = state.strikeMode === 'moneyness' ? 'M' : 'S';
+  // Initial strike button text based on mode
+  const strikeText = state.strikeMode === 'moneyness' ? 'ATM' : 'Strike';
   return `
     <div class="oa-drag-handle"></div>
     <div class="oa-header">
@@ -559,15 +672,21 @@ function buildScalpingUI() {
     <div class="oa-controls">
       <button id="oa-action-btn" class="oa-toggle buy">B</button>
       <button id="oa-option-type-btn" class="oa-toggle">CE</button>
-      <button id="oa-strike-btn" class="oa-strike-select">ATM --</button>
+      <button id="oa-strike-btn" class="oa-strike-select">${strikeText}</button>
       <div class="oa-lots">
         <button id="oa-lots-dec" class="oa-lot-btn">−</button>
-        <input id="oa-lots" type="number" value="1" min="1">
+        <div class="oa-input-wrapper">
+          <input id="oa-lots" type="text" value="1">
+          <button id="oa-lots-update" class="oa-input-update" title="Update">↻</button>
+        </div>
         <button id="oa-lots-inc" class="oa-lot-btn">+</button>
         <span class="oa-lots-label">LOTS</span>
       </div>
       <button id="oa-ordertype-btn" class="oa-toggle oa-ordertype-fixed">${state.orderType}</button>
-      <input id="oa-price" type="number" class="oa-price-input" value="0" step="0.05">
+      <div class="oa-input-wrapper price-wrapper">
+        <input id="oa-price" type="text" class="oa-price-input" value="0">
+        <button id="oa-price-update" class="oa-input-update" title="Update">↻</button>
+      </div>
       <button id="oa-order-btn" class="oa-order-btn buy">BUY @ --</button>
     </div>
     <div id="oa-strike-dropdown" class="oa-strike-dropdown hidden">
@@ -576,7 +695,7 @@ function buildScalpingUI() {
         <div id="oa-expiry-slider" class="oa-expiry-slider"></div>
         <button id="oa-expiry-right" class="oa-expiry-arrow">›</button>
       </div>
-      <div class="oa-strike-header"><span>Moneyness</span><span>Strike</span><span>LTP</span></div>
+      <div class="oa-strike-header"><span>Moneyness</span><span id="oa-strike-col">Strike</span><span id="oa-ltp-col">LTP</span></div>
       <div id="oa-strike-list" class="oa-strike-list"></div>
       <div class="oa-strike-actions">
         <button id="oa-update-strikes" class="oa-action-btn" title="Update strikes & quotes">⟳ Update</button>
@@ -620,6 +739,7 @@ function setupScalpingEvents(container) {
     e.target.textContent = state.action === 'BUY' ? 'B' : 'S';
     e.target.className = `oa-toggle ${state.action === 'BUY' ? 'buy' : 'sell'}`;
     updateOrderButton();
+    fetchMargin();
   });
 
   // Option type toggle (CE/PE) - with loading animation and price update
@@ -645,14 +765,16 @@ function setupScalpingEvents(container) {
 
   // Lots controls
   container.querySelector('#oa-lots-dec')?.addEventListener('click', () => {
-    if (state.lots > 1) { state.lots--; document.getElementById('oa-lots').value = state.lots; }
+    if (state.lots > 1) { state.lots--; document.getElementById('oa-lots').value = state.lots; fetchMargin(); }
   });
   container.querySelector('#oa-lots-inc')?.addEventListener('click', () => {
     state.lots++; document.getElementById('oa-lots').value = state.lots;
+    fetchMargin();
   });
   container.querySelector('#oa-lots')?.addEventListener('change', (e) => {
     state.lots = Math.max(1, parseInt(e.target.value) || 1);
     e.target.value = state.lots;
+    fetchMargin();
   });
 
   // Order type toggle
@@ -664,10 +786,32 @@ function setupScalpingEvents(container) {
     updatePriceDisplay();
   });
 
-  // Price input
-  container.querySelector('#oa-price')?.addEventListener('change', (e) => {
+  // Price input - update on blur (click outside) only
+  const priceInput = container.querySelector('#oa-price');
+  priceInput?.addEventListener('blur', (e) => {
     state.price = parseFloat(e.target.value) || 0;
     updateOrderButton();
+    fetchMargin();
+  });
+
+  // Price update button (↻)
+  container.querySelector('#oa-price-update')?.addEventListener('click', () => {
+    const priceEl = document.getElementById('oa-price');
+    if (priceEl) {
+      state.price = parseFloat(priceEl.value) || 0;
+      updateOrderButton();
+      fetchMargin();
+    }
+  });
+
+  // Lots update button (↻)
+  container.querySelector('#oa-lots-update')?.addEventListener('click', () => {
+    const lotsEl = document.getElementById('oa-lots');
+    if (lotsEl) {
+      state.lots = Math.max(1, parseInt(lotsEl.value) || 1);
+      lotsEl.value = state.lots;
+      fetchMargin();
+    }
   });
 
   // Order button
@@ -739,29 +883,27 @@ function toggleRefreshPanel() {
 function buildRefreshPanel() {
   return `
     <div class="oa-refresh-content">
-      <h4>Refresh Settings</h4>
-      <div class="oa-form-group">
-        <label>Mode</label>
-        <select id="oa-refresh-mode">
-          <option value="manual" ${state.refreshMode === 'manual' ? 'selected' : ''}>Manual</option>
-          <option value="auto" ${state.refreshMode === 'auto' ? 'selected' : ''}>Auto</option>
-        </select>
-      </div>
-      <div class="oa-form-group" id="oa-interval-group" ${state.refreshMode === 'manual' ? 'style="display:none"' : ''}>
-        <label>Interval (sec)</label>
-        <input id="oa-refresh-interval" type="number" min="3" max="60" value="${state.refreshIntervalSec}">
-      </div>
-      <div class="oa-form-group">
-        <label>Data to Refresh</label>
-        <div class="oa-checkbox-group">
-          <label class="oa-checkbox-item"><input type="checkbox" id="oa-ref-funds" ${state.refreshAreas.funds ? 'checked' : ''}> Funds</label>
-          <label class="oa-checkbox-item"><input type="checkbox" id="oa-ref-underlying" ${state.refreshAreas.underlying ? 'checked' : ''}> Underlying</label>
-          <label class="oa-checkbox-item"><input type="checkbox" id="oa-ref-selectedStrike" ${state.refreshAreas.selectedStrike ? 'checked' : ''}> Selected strike</label>
+      <div class="oa-refresh-row">
+        <div class="oa-refresh-col">
+          <label class="oa-small-label">Mode</label>
+          <select id="oa-refresh-mode" class="oa-small-select">
+            <option value="manual" ${state.refreshMode === 'manual' ? 'selected' : ''}>Manual</option>
+            <option value="auto" ${state.refreshMode === 'auto' ? 'selected' : ''}>Auto</option>
+          </select>
         </div>
+        <div class="oa-refresh-col" id="oa-interval-group" ${state.refreshMode === 'manual' ? 'style="display:none"' : ''}>
+          <label class="oa-small-label">Sec</label>
+          <input id="oa-refresh-interval" type="number" min="3" max="60" value="${state.refreshIntervalSec}" class="oa-small-input">
+        </div>
+      </div>
+      <div class="oa-checkbox-inline">
+        <label class="oa-checkbox-compact"><input type="checkbox" id="oa-ref-funds" ${state.refreshAreas.funds ? 'checked' : ''}> Funds</label>
+        <label class="oa-checkbox-compact"><input type="checkbox" id="oa-ref-underlying" ${state.refreshAreas.underlying ? 'checked' : ''}> Undly</label>
+        <label class="oa-checkbox-compact"><input type="checkbox" id="oa-ref-selectedStrike" ${state.refreshAreas.selectedStrike ? 'checked' : ''}> Strike</label>
       </div>
       <div class="oa-refresh-actions">
         <button id="oa-refresh-save" class="oa-btn primary">Save</button>
-        <button id="oa-refresh-now" class="oa-btn success">Refresh Now</button>
+        <button id="oa-refresh-now" class="oa-btn success">Now</button>
       </div>
     </div>
   `;
@@ -943,6 +1085,10 @@ function buildSettingsPanel() {
         <input id="oa-apikey" type="text" value="${settings.apiKey}">
       </div>
       <div class="oa-form-group">
+        <label>Rate Limit (ms delay between API calls)</label>
+        <input id="oa-ratelimit" type="number" min="0" max="1000" value="${state.rateLimit}">
+      </div>
+      <div class="oa-form-group">
         <label>UI Mode</label>
         <select id="oa-uimode">
           <option value="scalping" ${isScalping ? 'selected' : ''}>Options Scalping</option>
@@ -1084,7 +1230,16 @@ function setupSettingsEvents(panel) {
         sym.optionExchange = deriveOptionExchange(sym.exchange);
         sym.productType = form.querySelector('#oa-edit-product').value;
         await saveSettings({ symbols: settings.symbols });
-        location.reload();
+        // Update UI without reload
+        form.classList.add('hidden');
+        panel.innerHTML = buildSettingsPanel();
+        setupSettingsEvents(panel);
+        // Update symbol dropdown in main UI
+        const select = document.getElementById('oa-symbol-select');
+        if (select) {
+          select.innerHTML = settings.symbols.map(s => `<option value="${s.id}" ${s.id === settings.activeSymbolId ? 'selected' : ''}>${s.symbol}</option>`).join('');
+        }
+        showNotification('Symbol updated!', 'success');
       });
       form.querySelector('#oa-cancel-edit')?.addEventListener('click', () => form.classList.add('hidden'));
     });
@@ -1095,17 +1250,37 @@ function setupSettingsEvents(panel) {
     const newSettings = {
       hostUrl: panel.querySelector('#oa-host').value,
       apiKey: panel.querySelector('#oa-apikey').value,
-      uiMode: panel.querySelector('#oa-uimode').value
+      uiMode: panel.querySelector('#oa-uimode').value,
+      rateLimit: parseInt(panel.querySelector('#oa-ratelimit').value) || 100
     };
+    state.rateLimit = newSettings.rateLimit;
+
     if (newSettings.uiMode === 'quick') {
       newSettings.symbol = panel.querySelector('#oa-quick-symbol')?.value || '';
       newSettings.exchange = panel.querySelector('#oa-quick-exchange')?.value || 'NSE';
       newSettings.product = panel.querySelector('#oa-quick-product')?.value || 'MIS';
       newSettings.quantity = panel.querySelector('#oa-quick-qty')?.value || '1';
     }
+
+    const modeChanged = newSettings.uiMode !== settings.uiMode;
     await saveSettings(newSettings);
     showNotification('Settings saved!', 'success');
-    if (newSettings.uiMode !== settings.uiMode) location.reload();
+
+    // Apply UI mode change without full reload - rebuild UI
+    if (modeChanged) {
+      const container = document.getElementById('openalgo-controls');
+      if (container) {
+        container.innerHTML = newSettings.uiMode === 'scalping' ? buildScalpingUI() : buildQuickUI();
+        if (newSettings.uiMode === 'scalping') {
+          setupScalpingEvents(container);
+          applyTheme(state.theme);
+          fetchExpiry();
+          startDataRefresh();
+        } else {
+          setupQuickEvents(container);
+        }
+      }
+    }
     toggleSettingsPanel();
   });
 }
@@ -1141,7 +1316,9 @@ function injectStyles() {
   const style = document.createElement('style');
   style.textContent = `
     /* Base container - Compact sizing */
-    .oa-container { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #000; color: #eee; border-radius: 10px; box-shadow: 0 8px 32px rgba(0,0,0,0.5); padding: 8px; min-width: 360px; font-size: 11px; }
+    .oa-container { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #000; color: #eee; border-radius: 10px; box-shadow: 0 8px 32px rgba(0,0,0,0.5); padding: 8px; font-size: 11px; position: relative; }
+    .oa-container.oa-scalping { min-width: 360px; }
+    .oa-container.oa-quick { min-width: auto; }
     .oa-container.oa-dark-theme { background: #000; color: #eee; }
     .oa-container.oa-light-theme { background: #fff; color: #222; box-shadow: 0 4px 20px rgba(0,0,0,0.15); }
     .oa-light-theme .oa-select, .oa-light-theme .oa-toggle, .oa-light-theme .oa-strike-select, .oa-light-theme .oa-lot-btn, .oa-light-theme .oa-lots input, .oa-light-theme .oa-price-input { background: #f0f0f0; color: #222; border-color: #ccc; }
@@ -1181,14 +1358,28 @@ function injectStyles() {
     .oa-lot-btn { background: #222; color: #fff; border: none; border-radius: 3px; width: 22px; height: 22px; cursor: pointer; font-size: 14px; }
     .oa-lots input { width: 32px; background: #111; color: #fff; border: 1px solid #333; border-radius: 3px; text-align: center; padding: 3px; font-size: 10px; }
     .oa-lots-label { font-size: 9px; color: #666; }
-    .oa-price-input { width: 55px; background: #111; color: #fff; border: 1px solid #333; border-radius: 4px; padding: 5px; text-align: right; font-size: 10px; }
+    
+    /* Input wrapper with update button */
+    .oa-input-wrapper { position: relative; display: inline-flex; align-items: center; }
+    .oa-input-wrapper input { padding-right: 18px; }
+    .oa-input-update { position: absolute; right: 2px; top: 50%; transform: translateY(-50%); background: transparent; border: none; color: #666; font-size: 10px; cursor: pointer; padding: 2px; line-height: 1; }
+    .oa-input-update:hover { color: #00e676; }
+    .oa-lots .oa-input-wrapper input { width: 32px; background: #111; color: #fff; border: 1px solid #333; border-radius: 3px; text-align: center; padding: 3px 18px 3px 3px; font-size: 10px; }
+    .price-wrapper { margin-right: 2px; }
+    .oa-price-input { width: 55px; background: #111; color: #fff; border: 1px solid #333; border-radius: 4px; padding: 5px 18px 5px 5px; text-align: right; font-size: 10px; }
     .oa-price-input:disabled { opacity: 0.5; }
-    .oa-order-btn { padding: 6px 12px; border: none; border-radius: 6px; font-weight: 700; cursor: pointer; text-transform: uppercase; font-size: 10px; }
+    
+    /* Remove spinner arrows from number inputs */
+    input[type="text"]::-webkit-outer-spin-button, input[type="text"]::-webkit-inner-spin-button,
+    input[type="number"]::-webkit-outer-spin-button, input[type="number"]::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+    input[type="text"], input[type="number"] { -moz-appearance: textfield; }
+    
+    .oa-order-btn { padding: 6px 12px; border: none; border-radius: 6px; font-weight: 700; cursor: pointer; text-transform: uppercase; font-size: 10px; white-space: nowrap; }
     .oa-order-btn.buy { background: linear-gradient(135deg, #00c853, #00e676); color: #000; }
     .oa-order-btn.sell { background: linear-gradient(135deg, #ff1744, #ff5252); color: #fff; }
     
-    /* Strike dropdown */
-    .oa-strike-dropdown { position: absolute; top: 100%; left: 0; right: 0; background: #000; border: 1px solid #222; border-radius: 6px; margin-top: 4px; max-height: 280px; overflow: hidden; z-index: 100; width: 240px; }
+    /* Strike dropdown - left aligned */
+    .oa-strike-dropdown { position: absolute; top: 100%; left: 0; background: #000; border: 1px solid #222; border-radius: 6px; margin-top: 4px; max-height: 280px; overflow: hidden; z-index: 100; width: 240px; }
     .oa-strike-dropdown.hidden { display: none; }
     .oa-expiry-container { display: flex; align-items: center; border-bottom: 1px solid #222; }
     .oa-expiry-arrow { background: transparent; border: none; color: #666; font-size: 16px; cursor: pointer; padding: 4px 6px; }
@@ -1198,6 +1389,7 @@ function injectStyles() {
     .oa-expiry-btn { background: #111; color: #888; border: none; border-radius: 3px; padding: 4px 8px; font-size: 9px; cursor: pointer; white-space: nowrap; }
     .oa-expiry-btn.active { background: #3a3a6a; color: #fff; }
     .oa-strike-header { display: grid; grid-template-columns: 0.8fr 1fr 0.6fr; padding: 4px 8px; font-size: 9px; color: #555; border-bottom: 1px solid #222; }
+    .oa-strike-header span { position: relative; overflow: hidden; }
     .oa-strike-list { max-height: 150px; overflow-y: auto; }
     .oa-strike-row { display: grid; grid-template-columns: 0.8fr 1fr 0.6fr; padding: 5px 8px; cursor: pointer; font-size: 10px; }
     .oa-strike-row:hover { background: #111; }
@@ -1218,18 +1410,22 @@ function injectStyles() {
     .oa-action-btn:hover { background: #333; color: #fff; }
     .oa-action-btn.oa-loading { opacity: 0.7; pointer-events: none; }
     
-    /* Refresh panel - fixed width */
-    .oa-refresh-panel { position: absolute; top: 100%; left: 0; background: #000; border: 1px solid #222; border-radius: 6px; margin-top: 4px; z-index: 102; width: 240px; }
+    /* Refresh panel - compact right aligned */
+    .oa-refresh-panel { position: absolute; top: 100%; right: 0; left: auto; background: #000; border: 1px solid #222; border-radius: 6px; margin-top: 4px; z-index: 102; width: 200px; }
     .oa-refresh-panel.hidden { display: none; }
-    .oa-refresh-content { padding: 10px; }
-    .oa-refresh-content h4 { margin: 0 0 8px; font-size: 11px; color: #888; }
-    .oa-checkbox-group { display: flex; flex-direction: column; gap: 6px; }
-    .oa-checkbox-item { display: flex; align-items: center; gap: 8px; font-size: 10px; color: #ccc; cursor: pointer; }
-    .oa-checkbox-item input[type="checkbox"] { width: 14px; height: 14px; margin: 0; flex-shrink: 0; }
-    .oa-refresh-actions { display: flex; gap: 6px; margin-top: 10px; }
+    .oa-refresh-content { padding: 8px; }
+    .oa-refresh-row { display: flex; gap: 8px; margin-bottom: 6px; }
+    .oa-refresh-col { display: flex; flex-direction: column; gap: 2px; }
+    .oa-small-label { font-size: 8px; color: #666; }
+    .oa-small-select { background: #111; color: #fff; border: 1px solid #333; border-radius: 3px; padding: 3px 4px; font-size: 9px; }
+    .oa-small-input { width: 40px; background: #111; color: #fff; border: 1px solid #333; border-radius: 3px; padding: 3px 4px; font-size: 9px; text-align: center; }
+    .oa-checkbox-inline { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 6px; }
+    .oa-checkbox-compact { display: flex; align-items: center; gap: 3px; font-size: 9px; color: #aaa; cursor: pointer; }
+    .oa-checkbox-compact input[type="checkbox"] { width: 12px; height: 12px; margin: 0; }
+    .oa-refresh-actions { display: flex; gap: 4px; }
     
-    /* Settings panel - fixed width */
-    .oa-settings-panel { position: absolute; top: 100%; left: 0; background: #000; border: 1px solid #222; border-radius: 6px; margin-top: 4px; z-index: 101; max-height: 350px; overflow-y: auto; width: 240px; }
+    /* Settings panel - right aligned */
+    .oa-settings-panel { position: absolute; top: 100%; right: 0; left: auto; background: #000; border: 1px solid #222; border-radius: 6px; margin-top: 4px; z-index: 101; max-height: 350px; overflow-y: auto; width: 240px; }
     .oa-settings-panel.hidden { display: none; }
     .oa-settings-content { padding: 10px; }
     .oa-settings-content h3 { margin: 0 0 10px; font-size: 12px; }
