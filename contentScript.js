@@ -47,7 +47,7 @@ async function init() {
   injectStyles();
   injectUI();
   applyTheme(state.theme);
-  if (settings.uiMode === 'scalping' && settings.symbols?.length > 0) {
+  if (settings.uiMode === 'scalping' && settings.symbols?.length > 0 && settings.apiKey && settings.hostUrl) {
     fetchExpiry(); // Fetch expiry on initial load
     startDataRefresh();
   }
@@ -153,16 +153,39 @@ async function apiCall(endpoint, data) {
   }
 }
 
-// Rate limiter - delays between API calls
-let lastApiCallTime = 0;
+// Rate limiter - queue-based to handle concurrent requests properly
+let apiCallQueue = [];
+let isProcessingQueue = false;
+
 async function rateLimitedApiCall(endpoint, data) {
-  const now = Date.now();
-  const elapsed = now - lastApiCallTime;
-  if (elapsed < state.rateLimit) {
-    await new Promise(r => setTimeout(r, state.rateLimit - elapsed));
+  return new Promise((resolve, reject) => {
+    apiCallQueue.push({ endpoint, data, resolve, reject });
+    processApiQueue();
+  });
+}
+
+async function processApiQueue() {
+  if (isProcessingQueue || apiCallQueue.length === 0) return;
+
+  isProcessingQueue = true;
+
+  while (apiCallQueue.length > 0) {
+    const { endpoint, data, resolve, reject } = apiCallQueue.shift();
+
+    try {
+      const result = await apiCall(endpoint, data);
+      resolve(result);
+
+      // Wait for rate limit delay before processing next call
+      if (apiCallQueue.length > 0) {
+        await new Promise(r => setTimeout(r, state.rateLimit));
+      }
+    } catch (error) {
+      reject(error);
+    }
   }
-  lastApiCallTime = Date.now();
-  return apiCall(endpoint, data);
+
+  isProcessingQueue = false;
 }
 
 // Fetch margin for current order
@@ -199,7 +222,7 @@ async function fetchUnderlyingQuote() {
   if (!symbol) return;
   state.loading.underlying = true;
   showLoadingIndicator('underlying');
-  const result = await apiCall('/api/v1/quotes', { symbol: symbol.symbol, exchange: symbol.exchange });
+  const result = await rateLimitedApiCall('/api/v1/quotes', { symbol: symbol.symbol, exchange: symbol.exchange });
   state.loading.underlying = false;
   hideLoadingIndicator('underlying');
   if (result.status === 'success' && result.data) {
@@ -213,7 +236,7 @@ async function fetchUnderlyingQuote() {
 async function fetchFunds() {
   state.loading.funds = true;
   showLoadingIndicator('funds');
-  const result = await apiCall('/api/v1/funds', {});
+  const result = await rateLimitedApiCall('/api/v1/funds', {});
   state.loading.funds = false;
   hideLoadingIndicator('funds');
   if (result.status === 'success' && result.data) {
@@ -227,6 +250,9 @@ async function fetchFunds() {
 
 // Fetch expiry list
 async function fetchExpiry() {
+  // Don't fetch if API credentials are not configured
+  if (!settings.apiKey || !settings.hostUrl) return;
+
   const symbol = getActiveSymbol();
   if (!symbol) return;
   const result = await rateLimitedApiCall('/api/v1/expiry', {
@@ -249,25 +275,47 @@ async function fetchExpiry() {
 }
 
 // Fetch strike chain using optionsymbol API
-async function fetchStrikeChain() {
-  const symbol = getActiveSymbol();
-  if (!symbol || !state.selectedExpiry) return;
+let isFetchingStrikeChain = false;
+let isExtendingStrikes = false;
 
-  const offsets = ['ITM5', 'ITM4', 'ITM3', 'ITM2', 'ITM1', 'ATM', 'OTM1', 'OTM2', 'OTM3', 'OTM4', 'OTM5'];
-  const promises = offsets.map(offset =>
-    apiCall('/api/v1/optionsymbol', {
-      strategy: 'Chrome',
-      underlying: symbol.symbol,
-      exchange: symbol.exchange,
-      expiry_date: state.selectedExpiry,
-      offset: offset,
-      option_type: state.optionType
-    })
-  );
+async function fetchStrikeChain() {
+  // Prevent concurrent executions
+  if (isFetchingStrikeChain) return;
+  isFetchingStrikeChain = true;
+
+  const symbol = getActiveSymbol();
+  if (!symbol || !state.selectedExpiry) {
+    isFetchingStrikeChain = false;
+    return;
+  }
+
+  // Build offsets dynamically based on current extend level
+  const offsets = [];
+  for (let i = state.extendLevel; i >= 1; i--) {
+    offsets.push(`ITM${i}`);
+  }
+  offsets.push('ATM');
+  for (let i = 1; i <= state.extendLevel; i++) {
+    offsets.push(`OTM${i}`);
+  }
 
   state.loading.strikes = true;
   showLoadingIndicator('strikes');
-  const results = await Promise.all(promises);
+
+  try {
+    // Make API calls sequentially to respect rate limits
+    const results = [];
+    for (const offset of offsets) {
+      const result = await rateLimitedApiCall('/api/v1/optionsymbol', {
+        strategy: 'Chrome',
+        underlying: symbol.symbol,
+        exchange: symbol.exchange,
+        expiry_date: state.selectedExpiry,
+        offset: offset,
+        option_type: state.optionType
+      });
+      results.push(result);
+    }
   strikeChain = offsets.map((offset, i) => {
     const r = results[i];
     if (r.status === 'success') {
@@ -292,13 +340,16 @@ async function fetchStrikeChain() {
 
   // Fetch LTPs for all strikes
   await fetchStrikeLTPs();
+  } finally {
+    isFetchingStrikeChain = false;
+  }
 }
 
 // Fetch LTPs for strike chain
 async function fetchStrikeLTPs() {
   if (strikeChain.length === 0) return;
   const symbols = strikeChain.map(s => ({ symbol: s.symbol, exchange: s.exchange }));
-  const result = await apiCall('/api/v1/multiquotes', { symbols });
+  const result = await rateLimitedApiCall('/api/v1/multiquotes', { symbols });
 
   if (result.status === 'success' && result.results) {
     result.results.forEach(r => {
@@ -430,6 +481,9 @@ function makeLegacyApiCall(url, data, actionText) {
 
 // Start data refresh interval (expiry only on init, not in interval)
 function startDataRefresh() {
+  // Don't start data refresh if API credentials are not configured
+  if (!settings.apiKey || !settings.hostUrl) return;
+
   if (state.refreshAreas.underlying) fetchUnderlyingQuote();
   if (state.refreshAreas.funds) fetchFunds();
   // Don't fetch expiry here - only on symbol change and initial load
@@ -752,8 +806,10 @@ function setupScalpingEvents(container) {
     state.selectedExpiry = '';
     state.selectedSymbol = ''; // Clear symbol to prevent stale margin calls
     state.extendLevel = 5;
-    fetchExpiry(); // Only fetch expiry on symbol change
-    startDataRefresh();
+    if (settings.apiKey && settings.hostUrl) {
+      fetchExpiry(); // Only fetch expiry on symbol change
+      startDataRefresh();
+    }
   });
 
   // Action toggle (B/S)
@@ -973,13 +1029,27 @@ function hideLoadingIndicator(area) {
 // Strike dropdown control functions
 async function updateStrikesAndQuotes() {
   const btn = document.getElementById('oa-update-strikes');
-  if (btn) btn.classList.add('oa-loading');
+  const strikeCol = document.getElementById('oa-strike-col');
+  const ltpCol = document.getElementById('oa-ltp-col');
+
+  // Always show loading on button
+  btn?.classList.add('oa-loading');
 
   if (state.strikeMode === 'moneyness') {
+    // Show loading on strike column first for moneyness mode
+    strikeCol?.classList.add('oa-loading');
+
     // Re-fetch moneyness-based strikes using optionsymbol API
     await fetchStrikeChain();
+
+    // Now loading on LTP column while quotes fetch
+    strikeCol?.classList.remove('oa-loading');
+    ltpCol?.classList.add('oa-loading');
+
+    await fetchStrikeLTPs();
   } else {
-    // In strike mode, just update quotes
+    // In strike mode, only show loading on LTP column (only quotes update)
+    ltpCol?.classList.add('oa-loading');
     await fetchStrikeLTPs();
   }
 
@@ -988,7 +1058,9 @@ async function updateStrikesAndQuotes() {
     updatePriceDisplay();
   }
 
-  if (btn) btn.classList.remove('oa-loading');
+  // Remove all loading
+  btn?.classList.remove('oa-loading');
+  ltpCol?.classList.remove('oa-loading');
 }
 
 async function toggleStrikeMode() {
@@ -1006,8 +1078,13 @@ async function toggleStrikeMode() {
 }
 
 async function extendStrikes() {
-  const symbol = getActiveSymbol();
-  if (!symbol || !state.selectedExpiry) return;
+  // Prevent concurrent executions
+  if (isExtendingStrikes) return;
+  isExtendingStrikes = true;
+
+  try {
+    const symbol = getActiveSymbol();
+    if (!symbol || !state.selectedExpiry) return;
 
   const btn = document.getElementById('oa-extend-strikes');
   if (btn) btn.classList.add('oa-loading');
@@ -1016,19 +1093,19 @@ async function extendStrikes() {
   const newITM = `ITM${state.extendLevel}`;
   const newOTM = `OTM${state.extendLevel}`;
 
-  // Fetch new ITM and OTM strikes
-  const promises = [newITM, newOTM].map(offset =>
-    apiCall('/api/v1/optionsymbol', {
+  // Fetch new ITM and OTM strikes sequentially to respect rate limits
+  const results = [];
+  for (const offset of [newITM, newOTM]) {
+    const result = await rateLimitedApiCall('/api/v1/optionsymbol', {
       strategy: 'Chrome',
       underlying: symbol.symbol,
       exchange: symbol.exchange,
       expiry_date: state.selectedExpiry,
       offset: offset,
       option_type: state.optionType
-    })
-  );
-
-  const results = await Promise.all(promises);
+    });
+    results.push(result);
+  }
   const newStrikes = [];
 
   results.forEach((r, i) => {
@@ -1070,6 +1147,9 @@ async function extendStrikes() {
 
   updateStrikeDropdown();
   if (btn) btn.classList.remove('oa-loading');
+  } finally {
+    isExtendingStrikes = false;
+  }
 }
 
 // Build dynamic symbol for Strike mode
@@ -1317,8 +1397,10 @@ function setupSettingsEvents(panel) {
         if (newSettings.uiMode === 'scalping') {
           setupScalpingEvents(container);
           applyTheme(state.theme);
-          fetchExpiry();
-          startDataRefresh();
+          if (settings.apiKey && settings.hostUrl) {
+            fetchExpiry();
+            startDataRefresh();
+          }
         } else {
           setupQuickEvents(container);
         }
@@ -1372,8 +1454,8 @@ function injectStyles() {
     .oa-light-theme .oa-expiry-btn { background: #e8e8e8; color: #666; }
     .oa-light-theme .oa-expiry-btn.active { background: #5c6bc0; color: #fff; }
     .oa-light-theme .oa-strike-row:hover { background: #f5f5f5; }
-    .oa-light-theme .oa-strike-row.selected { background: #e3e8f0; }
-    .oa-light-theme .oa-strike-row.atm { background: #e8f5e9; }
+    .oa-light-theme .oa-strike-row.selected { background: #bbdefb; }
+    .oa-light-theme .oa-strike-row.atm { background: #c8e6c9; }
     .oa-light-theme .oa-form-group input, .oa-light-theme .oa-form-group select { background: #f5f5f5; color: #222; border-color: #ccc; }
     .oa-light-theme .oa-symbol-item { background: #f0f0f0; }
     .oa-light-theme .oa-strike-actions { background: #f5f5f5; border-top: 1px solid #ddd; }
@@ -1507,6 +1589,7 @@ function injectStyles() {
     /* Loading animation */
     .oa-loading { position: relative; overflow: hidden; }
     .oa-loading::after { content: ''; position: absolute; top: 0; left: 0; right: 0; bottom: 0; background: linear-gradient(90deg, transparent, rgba(255,255,255,0.15), transparent); animation: oa-shimmer 1s infinite; }
+    .oa-light-theme .oa-loading::after { background: linear-gradient(90deg, transparent, rgba(0,0,0,0.1), transparent); }
     @keyframes oa-shimmer { 0% { transform: translateX(-100%); } 100% { transform: translateX(100%); } }
     
     /* Notifications */
