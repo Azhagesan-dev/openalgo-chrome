@@ -27,6 +27,8 @@ let state = {
   loading: { funds: false, underlying: false, strikes: false, margin: false }
 };
 
+let isInitialized = false;
+
 let expiryList = [];
 let strikeChain = [];
 let settings = {};
@@ -37,7 +39,10 @@ document.addEventListener('DOMContentLoaded', init);
 if (document.readyState === 'interactive' || document.readyState === 'complete') init();
 
 async function init() {
-  if (document.getElementById('openalgo-controls')) return;
+  // Prevent multiple initializations
+  if (isInitialized || document.getElementById('openalgo-controls')) return;
+
+  isInitialized = true;
   settings = await loadSettings();
   injectStyles();
   injectUI();
@@ -59,11 +64,24 @@ function loadSettings() {
       state.refreshAreas = data.refreshAreas || { funds: true, underlying: true, selectedStrike: true };
       state.strikeMode = data.strikeMode || 'moneyness';
       state.useMoneyness = state.strikeMode === 'moneyness';
+
+      // Default symbols if none exist
+      let symbols = data.symbols || [];
+      if (symbols.length === 0) {
+        symbols = [{
+          id: 'default-nifty',
+          symbol: 'NIFTY',
+          exchange: 'NSE_INDEX',
+          optionExchange: 'NFO',
+          productType: 'MIS'
+        }];
+      }
+
       resolve({
         hostUrl: data.hostUrl || 'http://127.0.0.1:5000',
         apiKey: data.apiKey || '',
-        symbols: data.symbols || [],
-        activeSymbolId: data.activeSymbolId || '',
+        symbols: symbols,
+        activeSymbolId: data.activeSymbolId || symbols[0]?.id || '',
         uiMode: data.uiMode || 'scalping',
         symbol: data.symbol || '',
         exchange: data.exchange || 'NSE',
@@ -1358,6 +1376,11 @@ function injectStyles() {
     .oa-light-theme .oa-strike-row.atm { background: #e8f5e9; }
     .oa-light-theme .oa-form-group input, .oa-light-theme .oa-form-group select { background: #f5f5f5; color: #222; border-color: #ccc; }
     .oa-light-theme .oa-symbol-item { background: #f0f0f0; }
+    .oa-light-theme .oa-strike-actions { background: #f5f5f5; border-top: 1px solid #ddd; }
+    .oa-light-theme .oa-action-btn { background: #f0f0f0; color: #333; border: 1px solid #ccc; border-radius: 3px; font-size: 9px; cursor: pointer; text-align: center; flex: 1; padding: 5px 8px; }
+    .oa-light-theme .oa-action-btn:hover { background: #e0e0e0; color: #000; }
+    .oa-light-theme .oa-strike { color: #222; }
+    .oa-light-theme .oa-strike.editable { color: #3b82f6; }
     .oa-drag-handle { height: 3px; background: #333; border-radius: 2px; margin: -4px -4px 6px; cursor: move; }
     .oa-light-theme .oa-drag-handle { background: #ccc; }
     
@@ -1499,7 +1522,10 @@ function injectStyles() {
 // Listen for messages
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.action === 'injectButtons') {
-    init();
+    // Only re-initialize if not already done and no existing UI
+    if (!isInitialized && !document.getElementById('openalgo-controls')) {
+      init();
+    }
     sendResponse({ success: true });
   }
   return true;
