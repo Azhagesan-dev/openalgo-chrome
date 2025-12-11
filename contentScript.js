@@ -10,10 +10,10 @@ let state = {
   strikeMode: 'moneyness', // 'moneyness' or 'strike'
   extendLevel: 5, // Current ITM/OTM level (5 = ITM5/OTM5)
   useMoneyness: true,
-  lots: 1,
+  lots: 0, // Start with 0 until lot size is known
   orderType: 'MARKET',
   price: 0,
-  lotSize: 25,
+  lotSize: 0, // Start with 0 until determined
   underlyingLtp: 0,
   underlyingPrevClose: 0,
   optionLtp: 0,
@@ -24,7 +24,11 @@ let state = {
   refreshIntervalSec: 5,
   rateLimit: 100, // Delay between API calls in ms
   refreshAreas: { funds: true, underlying: true, selectedStrike: true },
-  loading: { funds: false, underlying: false, strikes: false, margin: false }
+  loading: { funds: false, underlying: false, strikes: false, margin: false },
+  quantityAutoCorrected: false, // Flag to track if quantity was auto-corrected
+  netposAutoCorrected: false, // Flag to track if netpos quantity was auto-corrected
+  fetchOpenPosAfterMargin: false,
+  currentNetQty: 0 // actual net position quantity (in qty units)
 };
 
 let isInitialized = false;
@@ -47,7 +51,9 @@ async function init() {
   injectStyles();
   injectUI();
   applyTheme(state.theme);
+  updateModeIndicator(); // Update mode indicator on init
   if (settings.uiMode === 'scalping' && settings.symbols?.length > 0 && settings.apiKey && settings.hostUrl) {
+    state.fetchOpenPosAfterMargin = true; // Enable netposition fetch after first margin call during init
     fetchExpiry(); // Fetch expiry on initial load
     startDataRefresh();
   }
@@ -73,7 +79,8 @@ function loadSettings() {
           symbol: 'NIFTY',
           exchange: 'NSE_INDEX',
           optionExchange: 'NFO',
-          productType: 'MIS'
+          productType: 'MIS',
+          quantityMode: 'lots' // 'lots' or 'quantity'
         }];
       }
 
@@ -121,6 +128,58 @@ function deriveOptionExchange(exchange) {
   if (exchange === 'NSE_INDEX' || exchange === 'NSE') return 'NFO';
   if (exchange === 'BSE_INDEX' || exchange === 'BSE') return 'BFO';
   return 'NFO';
+}
+
+// Quantity helpers
+function getQuantityMode() {
+  const symbol = getActiveSymbol();
+  return symbol?.quantityMode || 'lots';
+}
+
+function toLots(quantity) {
+  if (!state.lotSize) return 0;
+  if (!quantity) return 0;
+  const sign = quantity >= 0 ? 1 : -1;
+  const lots = Math.floor(Math.abs(quantity) / state.lotSize);
+  return sign * lots;
+}
+
+function toQuantity(displayValue) {
+  const normalized = Math.max(1, parseInt(displayValue, 10) || 1);
+  if (getQuantityMode() === 'lots') {
+    return state.lotSize ? normalized * state.lotSize : normalized;
+  }
+  return normalized;
+}
+
+function getDisplayQuantity(quantity = state.lots) {
+  if (!quantity) return 0;
+  return getQuantityMode() === 'lots'
+    ? toLots(quantity)
+    : quantity;
+}
+
+function getApiQuantity() {
+  return Math.max(1, state.lots || 1);
+}
+
+function syncQuantityInput() {
+  const lotsInput = document.getElementById('oa-lots');
+  if (!lotsInput) return;
+  // Keep loading state until lot size and a valid quantity are known
+  if (!state.lotSize || !state.lots) return;
+  const displayValue = getDisplayQuantity();
+  lotsInput.value = displayValue ? displayValue.toString() : '0';
+  lotsInput.classList.remove('loading');
+    if (document.body.classList.contains('oa-light-theme')) {
+      lotsInput.style.background = '#f0f0f0';
+      lotsInput.style.color = '#222';
+    }
+}
+
+function setQuantityFromDisplay(displayValue) {
+  state.lots = toQuantity(displayValue);
+  syncQuantityInput();
 }
 
 // Format number with commas
@@ -193,8 +252,17 @@ async function fetchMargin() {
   const symbol = getActiveSymbol();
   if (!symbol || !state.selectedSymbol) return;
 
+  // Don't fetch margin if quantity is invalid in quantity mode
+  if (symbol.quantityMode === 'quantity' && getApiQuantity() % state.lotSize !== 0) {
+    state.margin = 0;
+    updateOrderButton();
+    return;
+  }
+
   const price = state.orderType === 'MARKET' ? state.optionLtp : state.price;
   if (!price) return;
+
+  const quantity = getApiQuantity();
 
   state.loading.margin = true;
   const result = await rateLimitedApiCall('/api/v1/margin', {
@@ -204,7 +272,7 @@ async function fetchMargin() {
       action: state.action,
       product: symbol.product || 'MIS',
       pricetype: state.orderType === 'SL-M' ? 'SL-M' : (state.orderType === 'SL' ? 'SL' : (state.orderType === 'LIMIT' ? 'LIMIT' : 'MARKET')),
-      quantity: String(state.lots * state.lotSize),
+      quantity: String(quantity),
       price: String(price)
     }]
   });
@@ -214,6 +282,10 @@ async function fetchMargin() {
     updateOrderButton();
   }
   state.loading.margin = false;
+  if (state.fetchOpenPosAfterMargin) {
+    state.fetchOpenPosAfterMargin = false;
+    fetchOpenPosition();
+  }
 }
 
 // Fetch quotes for underlying
@@ -245,6 +317,24 @@ async function fetchFunds() {
     const unrealized = parseFloat(result.data.m2munrealized) || 0;
     const todayPL = realized + unrealized;
     updateFundsDisplay(available, todayPL);
+  }
+}
+
+// Fetch open position for current symbol
+async function fetchOpenPosition() {
+  const symbol = getActiveSymbol();
+  if (!symbol || !state.selectedSymbol) return;
+
+  const result = await rateLimitedApiCall('/api/v1/openposition', {
+    strategy: 'Chrome',
+    symbol: state.selectedSymbol,
+    exchange: symbol.optionExchange,
+    product: symbol.productType
+  });
+
+  if (result.status === 'success') {
+    const quantity = parseInt(result.quantity) || 0;
+    updateNetPosDisplay(quantity);
   }
 }
 
@@ -336,7 +426,11 @@ async function fetchStrikeChain() {
 
   // Store lotsize from ATM
   const atmStrike = strikeChain.find(s => s.offset === 'ATM');
-  if (atmStrike) state.lotSize = atmStrike.lotsize;
+  if (atmStrike) {
+    state.lotSize = atmStrike.lotsize;
+    // Initialize quantity input now that we know the lot size
+    initializeQuantityInput();
+  }
 
   // Fetch LTPs for all strikes
   await fetchStrikeLTPs();
@@ -385,7 +479,20 @@ async function placeOptionsOrder() {
   const symbol = getActiveSymbol();
   if (!symbol) return showNotification('No symbol selected', 'error');
 
-  const quantity = state.lotSize * state.lots;
+  // Check if quantity was auto-corrected and not manually verified
+  if (state.quantityAutoCorrected) {
+    showNotification('Invalid qty - Adjusted to nearest valid lot. Please confirm and place again.', 'error', 5000);
+    state.quantityAutoCorrected = false;
+    return;
+  }
+
+  // Check quantity validation in quantity mode
+  if (symbol.quantityMode === 'quantity' && state.lots % state.lotSize !== 0) {
+    return showNotification(`Quantity must be multiple of ${state.lotSize} (lot size)`, 'error');
+  }
+
+  const quantity = getApiQuantity();
+
   const data = {
     strategy: 'Chrome',
     underlying: symbol.symbol,
@@ -394,7 +501,7 @@ async function placeOptionsOrder() {
     offset: state.selectedOffset,
     option_type: state.optionType,
     action: state.action,
-    quantity: quantity,
+    quantity: String(quantity),
     pricetype: state.orderType,
     product: symbol.productType,
     price: state.orderType === 'LIMIT' || state.orderType === 'SL' ? String(state.price) : '0',
@@ -411,7 +518,20 @@ async function placePlaceOrder() {
   const selected = strikeChain.find(s => s.offset === state.selectedOffset);
   if (!symbol || !selected) return showNotification('No strike selected', 'error');
 
-  const quantity = state.lotSize * state.lots;
+  // Check if quantity was auto-corrected and not manually verified
+  if (state.quantityAutoCorrected) {
+    showNotification('Invalid qty - Adjusted to nearest valid lot. Please confirm and place again.', 'error', 5000);
+    state.quantityAutoCorrected = false;
+    return;
+  }
+
+  // Check quantity validation in quantity mode
+  if (symbol.quantityMode === 'quantity' && state.lots % state.lotSize !== 0) {
+    return showNotification(`Quantity must be multiple of ${state.lotSize} (lot size)`, 'error');
+  }
+
+  const quantity = getApiQuantity();
+
   const data = {
     strategy: 'Chrome',
     symbol: selected.symbol,
@@ -432,6 +552,8 @@ async function placePlaceOrder() {
 function handleOrderResponse(result) {
   if (result.status === 'success') {
     showNotification(`Order placed! ID: ${result.orderid}`, 'success');
+    // Refresh net position after successful order
+    setTimeout(() => fetchOpenPosition(), 1000); // Small delay to allow position to update
   } else {
     showNotification(`Order failed: ${result.message}`, 'error');
   }
@@ -563,12 +685,12 @@ async function refreshSelectedStrike() {
 }
 
 // Show notification
-function showNotification(message, type) {
+function showNotification(message, type, duration = 1000) {
   const n = document.createElement('div');
   n.className = `openalgo-notification ${type}`;
   n.textContent = message;
   document.body.appendChild(n);
-  setTimeout(() => { n.classList.add('fadeOut'); setTimeout(() => n.remove(), 500); }, 3000);
+  setTimeout(() => { n.classList.add('fadeOut'); setTimeout(() => n.remove(), 500); }, duration);
 }
 
 // UI update functions
@@ -585,6 +707,255 @@ function updateFundsDisplay(available, todayPL) {
   const plClass = todayPL >= 0 ? 'positive' : 'negative';
   const plSign = todayPL >= 0 ? '+' : '';
   el.innerHTML = `Avail: ₹${formatNumber(available, 0)} | <span class="${plClass}">P/L: ${plSign}₹${formatNumber(todayPL, 0)}</span>`;
+}
+
+function updateNetPosDisplay(quantity) {
+  const el = document.getElementById('oa-netpos');
+  const symbol = getActiveSymbol();
+  if (el && symbol) {
+    state.currentNetQty = quantity;
+    const displayValue = symbol.quantityMode === 'quantity'
+      ? quantity
+      : toLots(quantity);
+    el.dataset.qty = quantity.toString();
+    el.value = displayValue.toString();
+    updateResizeButton();
+  }
+}
+
+function updateNetPosDisplayMode() {
+  const el = document.getElementById('oa-netpos');
+  const symbol = getActiveSymbol();
+  if (el && symbol) {
+    const baseQty = parseInt(el.dataset.qty || el.value) || 0;
+    const displayValue = symbol.quantityMode === 'quantity'
+      ? baseQty
+      : toLots(baseQty);
+    el.value = displayValue.toString();
+    updateResizeButton();
+  }
+}
+
+function updateModeIndicator() {
+  const el = document.getElementById('oa-mode-indicator');
+  const symbol = getActiveSymbol();
+  if (el && symbol) {
+    el.textContent = symbol.quantityMode === 'quantity' ? 'QTY' : 'LOTS';
+    el.title = 'Click to toggle between QTY and LOTS mode';
+    el.style.background = symbol.quantityMode === 'quantity' ? 'rgba(0, 230, 118, 0.1)' : 'rgba(92, 107, 192, 0.1)';
+    el.style.color = symbol.quantityMode === 'quantity' ? '#00e676' : '#5c6bc0';
+  }
+  // Refresh quantity/net position display for the active mode
+  syncQuantityInput();
+  updateNetPosDisplayMode();
+  // Re-validate quantity when mode changes
+  validateQuantity();
+  updateResizeButton();
+}
+
+function getTargetNetQty() {
+  const el = document.getElementById('oa-netpos');
+  const symbol = getActiveSymbol();
+  if (!el || !symbol) return 0;
+  // dataset.qty stores base quantity (qty units)
+  const datasetQty = parseInt(el.dataset.qty || '0', 10);
+  if (datasetQty) return datasetQty;
+  const displayValue = parseInt(el.value || '0', 10) || 0;
+  if (symbol.quantityMode === 'quantity') return displayValue;
+  return displayValue * (state.lotSize || 1);
+}
+
+function updateResizeButton() {
+  const btn = document.getElementById('oa-resize-btn');
+  const symbol = getActiveSymbol();
+  if (!btn || !symbol) return;
+
+  const target = getTargetNetQty();
+  const qtyModeIsQty = getQuantityMode() === 'quantity';
+  const displayQty = Math.abs(qtyModeIsQty ? target : toLots(target));
+
+  btn.className = 'oa-resize-btn';
+  btn.textContent = `Resize ${displayQty}`;
+  const modeText = qtyModeIsQty ? 'qty' : 'lots';
+  btn.title = `Resize position to ${displayQty} ${modeText}`;
+}
+
+async function placeResize() {
+  const symbol = getActiveSymbol();
+  if (!symbol || !state.selectedSymbol) return showNotification('No symbol selected', 'error');
+
+  // Check if netpos quantity was auto-corrected and not manually verified
+  if (state.netposAutoCorrected) {
+    showNotification('Invalid qty - Adjusted to nearest valid lot. Please confirm and resize again.', 'error', 5000);
+    state.netposAutoCorrected = false;
+    return;
+  }
+
+  const targetQty = Math.max(0, getTargetNetQty()); // qty units for API
+
+  const data = {
+    strategy: 'Chrome',
+    symbol: state.selectedSymbol,
+    exchange: symbol.optionExchange,
+    action: state.action,
+    product: symbol.productType,
+    pricetype: 'MARKET',
+    quantity: String(targetQty),
+    position_size: String(targetQty),
+    price: '0',
+    trigger_price: '0'
+  };
+
+  const result = await apiCall('/api/v1/placesmartorder', data);
+  if (result.status === 'success') {
+    showNotification('Resize placed', 'success');
+    fetchOpenPosition();
+  } else {
+    showNotification(`Resize failed: ${result.message}`, 'error');
+  }
+}
+
+async function toggleQuantityModeUI() {
+  const symbol = getActiveSymbol();
+  if (!symbol) return;
+  symbol.quantityMode = symbol.quantityMode === 'quantity' ? 'lots' : 'quantity';
+  await saveSettings({ symbols: settings.symbols });
+  updateModeIndicator();
+  validateQuantity();
+  fetchOpenPosition();
+  showNotification(`Mode: ${symbol.quantityMode.toUpperCase()}`, 'success');
+}
+
+function initializeQuantityInput() {
+  const lotsInput = document.getElementById('oa-lots');
+  const lotsDecBtn = document.getElementById('oa-lots-dec');
+  const lotsIncBtn = document.getElementById('oa-lots-inc');
+  const lotsUpdateBtn = document.getElementById('oa-lots-update');
+
+  if (lotsInput && state.lotSize > 0) {
+    // Set initial quantity to 1 * lot size
+    state.lots = state.lotSize;
+    lotsInput.disabled = false;
+    lotsInput.readOnly = true; // Keep readonly like netpos
+    lotsInput.classList.remove('loading');
+    syncQuantityInput();
+
+    // Reset auto-corrected flag since this is proper initialization
+    state.quantityAutoCorrected = false;
+
+    // Enable buttons
+    if (lotsDecBtn) lotsDecBtn.disabled = false;
+    if (lotsIncBtn) lotsIncBtn.disabled = false;
+    if (lotsUpdateBtn) lotsUpdateBtn.disabled = false;
+
+    // Trigger validation and margin calculation
+    const validationPassed = validateQuantity();
+    if (validationPassed) {
+      fetchMargin();
+    }
+    updateResizeButton();
+  }
+}
+
+function validateQuantity() {
+  const lotsInput = document.getElementById('oa-lots');
+  const symbol = getActiveSymbol();
+
+  if (!lotsInput || !symbol) return true; // Return true if we can't validate
+  if (!state.lotSize) return true;
+
+  // Don't validate if input is still in loading state
+  if (lotsInput.classList.contains('oa-loading')) return true;
+
+  let validationPassed = true;
+
+  if (symbol.quantityMode === 'quantity') {
+    // In quantity mode, check if the entered quantity is multiple of lot size
+    const quantity = state.lots;
+    if (quantity % state.lotSize !== 0) {
+      // Auto-reset to nearest valid multiple of lot size
+      const remainder = quantity % state.lotSize;
+      const lowerMultiple = quantity - remainder;
+      const upperMultiple = lowerMultiple + state.lotSize;
+
+      // Choose the nearest valid quantity
+      const validQuantity = (remainder <= state.lotSize / 2) ? lowerMultiple : upperMultiple;
+
+      // Ensure we don't go below lot size
+      const finalValidQuantity = Math.max(state.lotSize, validQuantity);
+
+      state.lots = finalValidQuantity;
+      syncQuantityInput();
+      state.quantityAutoCorrected = true;
+      validationPassed = false;
+
+      // Show notification with longer duration
+      showNotification(`Warning invalid qty - Quantity reset to ${finalValidQuantity} (nearest valid multiple).`, 'error', 5000);
+    }
+  }
+  // Keep display in sync for lots mode
+  if (symbol.quantityMode === 'lots') {
+    syncQuantityInput();
+  }
+  // In lots mode, always valid since lots * lotSize is always valid
+  return validationPassed;
+}
+
+function validateNetposQuantity() {
+  const netposEl = document.getElementById('oa-netpos');
+  const symbol = getActiveSymbol();
+
+  if (!netposEl || !symbol) return true; // Return true if we can't validate
+  if (!state.lotSize) return true;
+
+  // Don't validate if input is still in loading state
+  if (netposEl.classList.contains('oa-loading')) return true;
+
+  let wasAutoCorrected = false;
+
+  if (symbol.quantityMode === 'quantity') {
+    // In quantity mode, check if the entered quantity is multiple of lot size
+    const displayValue = parseInt(netposEl.value || '0', 10) || 0;
+    const quantity = symbol.quantityMode === 'lots' ? displayValue * state.lotSize : displayValue;
+
+    if (quantity % state.lotSize !== 0) {
+      // Auto-reset to nearest valid multiple of lot size
+      const remainder = quantity % state.lotSize;
+      const lowerMultiple = quantity - remainder;
+      const upperMultiple = lowerMultiple + state.lotSize;
+
+      // Choose the nearest valid quantity
+      const validQuantity = (remainder <= state.lotSize / 2) ? lowerMultiple : upperMultiple;
+
+      // Ensure we don't go below lot size
+      const finalValidQuantity = Math.max(state.lotSize, validQuantity);
+
+      // Update the input value and dataset
+      const displayQty = symbol.quantityMode === 'lots' ? Math.floor(finalValidQuantity / state.lotSize) : finalValidQuantity;
+      netposEl.value = displayQty.toString();
+      netposEl.dataset.qty = finalValidQuantity.toString();
+
+      // Set auto-corrected flag to prevent automatic resize
+      state.netposAutoCorrected = true;
+      wasAutoCorrected = true;
+
+      // Show notification with longer duration
+      showNotification(`Warning invalid qty - Quantity reset to ${finalValidQuantity} (nearest valid multiple).`, 'error', 5000);
+    }
+  }
+  // Keep display in sync for lots mode
+  if (symbol.quantityMode === 'lots') {
+    const displayValue = parseInt(netposEl.value || '0', 10) || 0;
+    const qty = displayValue * (state.lotSize || 1);
+    netposEl.dataset.qty = qty.toString();
+  }
+
+  // Reset auto-corrected flag only if no correction was made
+  if (!wasAutoCorrected) {
+    state.netposAutoCorrected = false;
+  }
+
+  return !wasAutoCorrected; // Return true if no correction was made
 }
 
 function updateExpirySlider() {
@@ -663,6 +1034,8 @@ function updateStrikeDropdown() {
       toggleStrikeDropdown(false);
       // Immediately update dropdown HTML so it shows correct selection when opened again
       updateStrikeDropdown();
+      // Fetch net position for the selected strike
+      fetchOpenPosition();
     });
   });
 }
@@ -740,6 +1113,7 @@ function buildScalpingUI() {
         ${settings.symbols.length === 0 ? '<option value="">Add symbol in settings</option>' : ''}
       </select>
       <span id="oa-underlying-ltp" class="oa-ltp-display">--</span>
+      <span id="oa-mode-indicator" class="oa-mode-indicator">--</span>
       <span id="oa-funds" class="oa-funds">--</span>
       <button id="oa-theme-btn" class="oa-icon-btn" title="Toggle theme">${themeIcon}</button>
       <button id="oa-refresh-btn" class="oa-icon-btn" title="Refresh settings">🔄</button>
@@ -750,13 +1124,12 @@ function buildScalpingUI() {
       <button id="oa-option-type-btn" class="oa-toggle">CE</button>
       <button id="oa-strike-btn" class="oa-strike-select">${strikeText}</button>
       <div class="oa-lots">
-        <button id="oa-lots-dec" class="oa-lot-btn">−</button>
+        <button id="oa-lots-dec" class="oa-lot-btn" disabled>−</button>
         <div class="oa-input-wrapper">
-          <input id="oa-lots" type="text" value="1">
-          <button id="oa-lots-update" class="oa-input-update" title="Update">↻</button>
+          <input id="oa-lots" type="text" value="0" readonly>
+          <button id="oa-lots-update" class="oa-input-update" title="Update" disabled>↻</button>
         </div>
-        <button id="oa-lots-inc" class="oa-lot-btn">+</button>
-        <span class="oa-lots-label">LOTS</span>
+        <button id="oa-lots-inc" class="oa-lot-btn" disabled>+</button>
       </div>
       <button id="oa-ordertype-btn" class="oa-toggle oa-ordertype-fixed">${state.orderType}</button>
       <div class="oa-input-wrapper price-wrapper">
@@ -764,6 +1137,12 @@ function buildScalpingUI() {
         <button id="oa-price-update" class="oa-input-update" title="Update">↻</button>
       </div>
       <button id="oa-order-btn" class="oa-order-btn buy">BUY @ --</button>
+      <div class="oa-netpos-input-wrapper">
+        <input id="oa-netpos" type="text" class="oa-netpos-input" value="0" readonly>
+        <span class="oa-netpos-label" title="Net Position">P</span>
+        <button id="oa-netpos-update" class="oa-input-update" title="Refresh Net Position">↻</button>
+      </div>
+      <button id="oa-resize-btn" class="oa-resize-btn neutral" title="Resize position">Resize</button>
     </div>
     <div id="oa-strike-dropdown" class="oa-strike-dropdown hidden">
       <div class="oa-expiry-container">
@@ -806,10 +1185,18 @@ function setupScalpingEvents(container) {
     state.selectedExpiry = '';
     state.selectedSymbol = ''; // Clear symbol to prevent stale margin calls
     state.extendLevel = 5;
+    state.fetchOpenPosAfterMargin = true;
+    updateModeIndicator(); // Update mode indicator for new symbol
+    validateQuantity(); // Validate quantity for new symbol
     if (settings.apiKey && settings.hostUrl) {
       fetchExpiry(); // Only fetch expiry on symbol change
       startDataRefresh();
     }
+  });
+
+  // Quantity mode toggle (click on mode indicator)
+  container.querySelector('#oa-mode-indicator')?.addEventListener('click', () => {
+    toggleQuantityModeUI();
   });
 
   // Action toggle (B/S)
@@ -825,6 +1212,7 @@ function setupScalpingEvents(container) {
   container.querySelector('#oa-option-type-btn')?.addEventListener('click', async (e) => {
     state.optionType = state.optionType === 'CE' ? 'PE' : 'CE';
     e.target.textContent = state.optionType;
+    e.target.dataset.label = e.target.textContent;
     e.target.classList.add('oa-loading');
     await fetchStrikeChain();
     e.target.classList.remove('oa-loading');
@@ -844,16 +1232,81 @@ function setupScalpingEvents(container) {
 
   // Lots controls
   container.querySelector('#oa-lots-dec')?.addEventListener('click', () => {
-    if (state.lots > 1) { state.lots--; document.getElementById('oa-lots').value = state.lots; fetchMargin(); }
+    const symbol = getActiveSymbol();
+    const lotsInput = document.getElementById('oa-lots');
+
+    // Don't process if controls are disabled or in loading state
+    if (!symbol || !lotsInput || lotsInput.classList.contains('oa-loading')) return;
+
+    const step = state.lotSize || 1;
+    const minQuantity = state.lotSize || 1;
+
+    if (state.lots > minQuantity) {
+      state.lots = Math.max(minQuantity, state.lots - step);
+      syncQuantityInput();
+      state.quantityAutoCorrected = false; // Reset flag on manual change
+      const validationPassed = validateQuantity();
+      if (validationPassed) {
+        fetchMargin();
+      }
+    }
   });
   container.querySelector('#oa-lots-inc')?.addEventListener('click', () => {
-    state.lots++; document.getElementById('oa-lots').value = state.lots;
-    fetchMargin();
+    const symbol = getActiveSymbol();
+    const lotsInput = document.getElementById('oa-lots');
+
+    // Don't process if controls are disabled or in loading state
+    if (!symbol || !lotsInput || lotsInput.classList.contains('oa-loading')) return;
+
+    const step = state.lotSize || 1;
+      state.lots += step;
+      syncQuantityInput();
+      state.quantityAutoCorrected = false; // Reset flag on manual change
+      const validationPassed = validateQuantity();
+      if (validationPassed) {
+        fetchMargin();
+      }
+      updateResizeButton();
   });
+  // Qty input - handle click to enable editing (like netpos)
+  container.querySelector('#oa-lots')?.addEventListener('click', (e) => {
+    if (e.target.readOnly && !e.target.classList.contains('oa-loading')) {
+      e.target.readOnly = false;
+      e.target.classList.add('editable');
+      e.target.select();
+    }
+  });
+
+  // Qty input - handle blur (click outside)
+  container.querySelector('#oa-lots')?.addEventListener('blur', (e) => {
+    if (!e.target.readOnly) {
+      e.target.readOnly = true;
+      e.target.classList.remove('editable');
+    }
+  });
+
   container.querySelector('#oa-lots')?.addEventListener('change', (e) => {
-    state.lots = Math.max(1, parseInt(e.target.value) || 1);
-    e.target.value = state.lots;
-    fetchMargin();
+    // Don't process changes if input is in loading state
+    if (e.target.classList.contains('oa-loading')) return;
+
+    const symbol = getActiveSymbol();
+    const minDisplay = symbol ? (symbol.quantityMode === 'lots' ? 1 : (state.lotSize || 1)) : 1;
+    const newValue = Math.max(minDisplay, parseInt(e.target.value) || minDisplay);
+    setQuantityFromDisplay(newValue);
+
+    // Reset auto-corrected flag when user manually changes quantity
+    state.quantityAutoCorrected = false;
+
+    // Validate quantity in quantity mode
+    let validationPassed = true;
+    if (symbol && symbol.quantityMode === 'quantity') {
+      validationPassed = validateQuantity();
+    }
+
+    if (validationPassed) {
+      fetchMargin();
+    }
+    updateResizeButton();
   });
 
   // Order type toggle
@@ -886,17 +1339,122 @@ function setupScalpingEvents(container) {
   // Lots update button (↻)
   container.querySelector('#oa-lots-update')?.addEventListener('click', () => {
     const lotsEl = document.getElementById('oa-lots');
-    if (lotsEl) {
-      state.lots = Math.max(1, parseInt(lotsEl.value) || 1);
-      lotsEl.value = state.lots;
-      fetchMargin();
+    const symbol = getActiveSymbol();
+
+    // Don't process if controls are disabled or in loading state
+    if (!lotsEl || lotsEl.value === 'Loading...') return;
+
+    if (symbol) {
+      const minValue = symbol.quantityMode === 'lots' ? 1 : (state.lotSize || 1);
+      const newValue = Math.max(minValue, parseInt(lotsEl.value) || minValue);
+      setQuantityFromDisplay(newValue);
+      state.quantityAutoCorrected = false; // Reset flag on manual change
+
+      // Only validate in quantity mode
+      let validationPassed = true;
+      if (symbol.quantityMode === 'quantity') {
+        validationPassed = validateQuantity();
+      }
+
+      if (validationPassed) {
+        fetchMargin();
+      }
+      updateResizeButton();
+    }
+  });
+
+  // Net pos refresh functionality - double click on input to refresh
+  container.querySelector('#oa-netpos')?.addEventListener('dblclick', () => {
+    if (!document.getElementById('oa-netpos').classList.contains('editable')) {
+      fetchOpenPosition();
+    }
+  });
+
+  // Net pos input - make editable on click
+  container.querySelector('#oa-netpos')?.addEventListener('click', (e) => {
+    if (e.target.readOnly && !e.target.classList.contains('oa-loading')) {
+      e.target.readOnly = false;
+      e.target.classList.add('editable');
+      e.target.select();
+      e.target.dataset.editing = 'true';
+      // Update button title for editing mode
+      const updateBtn = document.getElementById('oa-netpos-update');
+      if (updateBtn) updateBtn.title = 'Set target qty';
+    }
+  });
+
+  // Net pos input - handle blur (click outside)
+  container.querySelector('#oa-netpos')?.addEventListener('blur', (e) => {
+    if (!e.target.readOnly) {
+      e.target.readOnly = true;
+      e.target.classList.remove('editable');
+      // Keep editing flag true so update button can still commit the value
+      e.target.dataset.editing = e.target.dataset.editing || 'true';
+      // Validate netpos quantity
+      validateNetposQuantity();
+    }
+  });
+
+  // Net pos input - handle change
+  container.querySelector('#oa-netpos')?.addEventListener('change', (e) => {
+    // Don't process changes if input is in loading state
+    if (e.target.value === 'Loading...' || e.target.readOnly) return;
+    validateNetposQuantity();
+    updateResizeButton();
+  });
+
+  // Net pos refresh button (↻)
+  container.querySelector('#oa-netpos-update')?.addEventListener('click', () => {
+    const netposEl = document.getElementById('oa-netpos');
+    const updateBtn = document.getElementById('oa-netpos-update');
+    const symbol = getActiveSymbol();
+    if (netposEl && (netposEl.dataset.editing === 'true' || !netposEl.readOnly)) {
+      // If user modified the quantity, commit the edited value
+      const newDisplayValue = Math.max(0, parseInt(netposEl.value) || 0);
+      const baseQty = symbol
+        ? (symbol.quantityMode === 'lots' ? newDisplayValue * (state.lotSize || 1) : newDisplayValue)
+        : newDisplayValue;
+      netposEl.dataset.qty = baseQty.toString();
+      netposEl.value = (symbol && symbol.quantityMode === 'lots' ? newDisplayValue : baseQty).toString();
+      // Make it readonly again after setting the value
+      netposEl.readOnly = true;
+      netposEl.classList.remove('editable');
+      netposEl.dataset.editing = 'false';
+      // Reset auto-corrected flag since user has confirmed the value
+      state.netposAutoCorrected = false;
+      // Reset button title back to refresh mode
+      if (updateBtn) updateBtn.title = 'Refresh Net Position';
+      updateResizeButton();
+    } else {
+      // If readonly, fetch current position
+      fetchOpenPosition();
+    }
+  });
+
+  // Resize button
+  container.querySelector('#oa-resize-btn')?.addEventListener('click', () => {
+    // Validate netpos quantity before placing resize order
+    const validationPassed = validateNetposQuantity();
+    // Only place resize if validation passed
+    if (validationPassed) {
+      placeResize();
     }
   });
 
   // Order button
   container.querySelector('#oa-order-btn')?.addEventListener('click', () => {
-    if (state.useMoneyness) placeOptionsOrder();
-    else placePlaceOrder();
+    // Validate quantity before placing order
+    const symbol = getActiveSymbol();
+    let validationPassed = true;
+    if (symbol && symbol.quantityMode === 'quantity') {
+      validationPassed = validateQuantity();
+    }
+
+    // Only place order if validation passed
+    if (validationPassed) {
+      if (state.useMoneyness) placeOptionsOrder();
+      else placePlaceOrder();
+    }
   });
 
   // Theme toggle
@@ -1280,7 +1838,8 @@ function setupSettingsEvents(panel) {
       symbol: symbolName,
       exchange: exchange,
       optionExchange: deriveOptionExchange(exchange),
-      productType: product
+      productType: product,
+      quantityMode: 'lots' // Default to lots mode
     };
     settings.symbols.push(newSymbol);
     if (!settings.activeSymbolId) settings.activeSymbolId = newSymbol.id;
@@ -1446,25 +2005,29 @@ function injectStyles() {
     .oa-container.oa-quick { min-width: auto; }
     .oa-container.oa-dark-theme { background: #000; color: #eee; }
     .oa-container.oa-light-theme { background: #fff; color: #222; box-shadow: 0 4px 20px rgba(0,0,0,0.15); }
-    .oa-light-theme .oa-select, .oa-light-theme .oa-toggle, .oa-light-theme .oa-strike-select, .oa-light-theme .oa-lot-btn, .oa-light-theme .oa-lots input, .oa-light-theme .oa-price-input { background: #f0f0f0; color: #222; border-color: #ccc; }
-    .oa-light-theme .oa-lots .oa-input-wrapper input { background: #f0f0f0; color: #222; border-color: #ccc; }
-    .oa-light-theme .oa-small-select, .oa-light-theme .oa-small-input { background: #f0f0f0; color: #222; border-color: #ccc; }
-    .oa-light-theme .oa-add-symbol input, .oa-light-theme .oa-add-symbol select { background: #f0f0f0; color: #222; border-color: #ccc; }
-    .oa-light-theme .oa-strike-dropdown, .oa-light-theme .oa-settings-panel, .oa-light-theme .oa-refresh-panel { background: #fff; border-color: #ddd; }
-    .oa-light-theme .oa-expiry-btn { background: #e8e8e8; color: #666; }
-    .oa-light-theme .oa-expiry-btn.active { background: #5c6bc0; color: #fff; }
-    .oa-light-theme .oa-strike-row:hover { background: #f5f5f5; }
-    .oa-light-theme .oa-strike-row.selected { background: #bbdefb; }
-    .oa-light-theme .oa-strike-row.atm { background: #c8e6c9; }
-    .oa-light-theme .oa-form-group input, .oa-light-theme .oa-form-group select { background: #f5f5f5; color: #222; border-color: #ccc; }
-    .oa-light-theme .oa-symbol-item { background: #f0f0f0; }
+    .oa-light-theme .oa-select, .oa-light-theme .oa-toggle, .oa-light-theme .oa-strike-select, .oa-light-theme .oa-lot-btn, .oa-light-theme .oa-price-input { background: #f0f0f0 !important; color: #222 !important; border-color: #ccc !important; }
+    .oa-light-theme .oa-lots input { background: #f0f0f0 !important; color: #222 !important; border-color: #ccc !important; }
+    .oa-light-theme .oa-lots input.editable { border-color: #3b82f6 !important; background: #fff !important; }
+    .oa-light-theme .oa-lots input[readonly]:hover { background: #e8e8e8 !important; }
+    .oa-light-theme .oa-small-select, .oa-light-theme .oa-small-input { background: #f0f0f0 !important; color: #222 !important; border-color: #ccc !important; }
+    .oa-light-theme .oa-add-symbol input, .oa-light-theme .oa-add-symbol select { background: #f0f0f0 !important; color: #222 !important; border-color: #ccc !important; }
+    .oa-light-theme .oa-strike-dropdown, .oa-light-theme .oa-settings-panel, .oa-light-theme .oa-refresh-panel { background: #fff !important; border-color: #ddd !important; }
+    .oa-light-theme .oa-expiry-btn { background: #e8e8e8 !important; color: #666 !important; }
+    .oa-light-theme .oa-expiry-btn.active { background: #5c6bc0 !important; color: #fff !important; }
+    .oa-light-theme .oa-strike-row:hover { background: #f5f5f5 !important; }
+    .oa-light-theme .oa-strike-row.selected { background: #bbdefb !important; }
+    .oa-light-theme .oa-strike-row.atm { background: #c8e6c9 !important; }
+    .oa-light-theme .oa-form-group input, .oa-light-theme .oa-form-group select { background: #f5f5f5 !important; color: #222 !important; border-color: #ccc !important; }
+    .oa-light-theme .oa-symbol-item { background: #f0f0f0 !important; }
+    .oa-light-theme .oa-mode-slider { background-color: #ddd !important; }
+    .oa-light-theme .oa-mode-switch:checked + .oa-mode-slider { background-color: #5c6bc0 !important; }
     .oa-light-theme .oa-strike-actions { background: #f5f5f5; border-top: 1px solid #ddd; }
-    .oa-light-theme .oa-action-btn { background: #f0f0f0; color: #333; border: 1px solid #ccc; border-radius: 3px; font-size: 9px; cursor: pointer; text-align: center; flex: 1; padding: 5px 8px; }
+    .oa-light-theme .oa-action-btn { background: #f0f0f0 !important; color: #333 !important; border: 1px solid #ccc !important; border-radius: 3px !important; font-size: 9px !important; cursor: pointer !important; text-align: center !important; flex: 1 !important; padding: 5px 8px !important; }
     .oa-light-theme .oa-action-btn:hover { background: #e0e0e0; color: #000; }
-    .oa-light-theme .oa-strike { color: #222; }
-    .oa-light-theme .oa-strike.editable { color: #3b82f6; }
+    .oa-light-theme .oa-strike { color: #222 !important; }
+    .oa-light-theme .oa-strike.editable { color: #3b82f6 !important; }
     .oa-drag-handle { height: 3px; background: #333; border-radius: 2px; margin: -4px -4px 6px; cursor: move; }
-    .oa-light-theme .oa-drag-handle { background: #ccc; }
+    .oa-light-theme .oa-drag-handle { background: #ccc !important; }
     
     /* Header */
     .oa-header { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; flex-wrap: wrap; }
@@ -1472,44 +2035,80 @@ function injectStyles() {
     .oa-ltp-display { font-size: 11px; font-weight: 600; display: flex; align-items: center; gap: 4px; }
     .oa-ltp-value { font-weight: 700; }
     .oa-change-text { color: #999; font-size: 10px; }
+    .oa-mode-indicator { font-size: 9px; color: #5c6bc0; font-weight: 700; padding: 2px 6px; border-radius: 3px; background: rgba(92, 107, 192, 0.1); cursor: pointer; }
+    .oa-mode-indicator:hover { filter: brightness(1.1); }
     .oa-funds { font-size: 10px; margin-left: auto; }
     .positive { color: #00e676 !important; }
     .negative { color: #ff5252 !important; }
     .oa-icon-btn { background: transparent; border: none; color: #666; font-size: 14px; cursor: pointer; padding: 2px 6px; }
     .oa-icon-btn:hover { color: #fff; }
-    .oa-light-theme .oa-icon-btn { color: #999; }
-    .oa-light-theme .oa-icon-btn:hover { color: #333; }
+    .oa-light-theme .oa-icon-btn { color: #999 !important; }
+    .oa-light-theme .oa-icon-btn:hover { color: #333 !important; }
     
     /* Controls row */
     .oa-controls { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
-    .oa-toggle { background: #222; color: #fff; border: none; border-radius: 4px; padding: 5px 10px; font-weight: 700; cursor: pointer; text-transform: uppercase; font-size: 10px; }
-    .oa-toggle.buy { background: #00c853; }
-    .oa-toggle.sell { background: #ff1744; }
-    .oa-ordertype-fixed { min-width: 55px; text-align: center; }
-    .oa-strike-select { background: #111; color: #fff; border: 1px solid #444; border-radius: 4px; padding: 5px 8px; cursor: pointer; min-width: 80px; font-size: 10px; }
+    .oa-toggle { background: #222 !important; color: #fff !important; border: none !important; border-radius: 4px !important; padding: 5px 10px !important; font-weight: 700 !important; cursor: pointer !important; text-transform: uppercase !important; font-size: 10px !important; height: auto !important; width: auto !important; }
+    .oa-toggle.buy { background: #00c853 !important; }
+    .oa-toggle.sell { background: #ff1744 !important; }
+    .oa-ordertype-fixed { min-width: 55px !important; text-align: center !important; }
+    .oa-strike-select { background: #111 !important; color: #fff !important; border: 1px solid #444 !important; border-radius: 4px !important; padding: 5px 8px !important; cursor: pointer !important; min-width: 80px !important; font-size: 10px !important; height: auto !important; }
     .oa-lots { display: flex; align-items: center; gap: 2px; }
-    .oa-lot-btn { background: #222; color: #fff; border: none; border-radius: 3px; width: 22px; height: 22px; cursor: pointer; font-size: 14px; }
-    .oa-lots input { width: 32px; background: #111; color: #fff; border: 1px solid #333; border-radius: 3px; text-align: center; padding: 3px; font-size: 10px; }
+    .oa-lot-btn { background: #222 !important; color: #fff !important; border: none !important; border-radius: 3px !important; width: 22px !important; height: 22px !important; cursor: pointer !important; font-size: 14px !important; padding: 0 !important; margin: 0 !important; }
+    .oa-lot-btn:disabled { background: #333 !important; color: #666 !important; cursor: not-allowed !important; }
+    .oa-light-theme .oa-lot-btn:disabled { background: #ccc !important; color: #999 !important; }
+    .oa-lots input { width: 80px !important; background: #111 !important; color: #fff !important; border: 1px solid #333 !important; border-radius: 4px !important; text-align: right !important; padding: 5px 18px 5px 5px !important; font-size: 10px !important; height: 24px !important; box-sizing: border-box !important; }
+    .oa-lots input:disabled { background: #222 !important; color: #666 !important; cursor: not-allowed !important; }
+    .oa-lots input.editable { border-color: #5c6bc0 !important; background: #1a1a2e !important; }
+    .oa-lots input[readonly] { cursor: pointer !important; }
+    .oa-lots input[readonly]:hover { background: #1a1a2e !important; }
     .oa-lots-label { font-size: 9px; color: #666; }
     
     /* Input wrapper with update button */
-    .oa-input-wrapper { position: relative; display: inline-flex; align-items: center; }
-    .oa-input-wrapper input { padding-right: 18px; }
-    .oa-input-update { position: absolute; right: 2px; top: 50%; transform: translateY(-50%); background: transparent; border: none; color: #666; font-size: 10px; cursor: pointer; padding: 2px; line-height: 1; }
-    .oa-input-update:hover { color: #00e676; }
-    .oa-lots .oa-input-wrapper input { width: 32px; background: #111; color: #fff; border: 1px solid #333; border-radius: 3px; text-align: center; padding: 3px 18px 3px 3px; font-size: 10px; }
+    .oa-input-wrapper { position: relative !important; display: inline-flex !important; align-items: center !important; }
+    .oa-input-wrapper input { padding-right: 18px !important; }
+    .oa-input-update { position: absolute !important; right: 2px !important; top: 50% !important; transform: translateY(-50%) !important; background: transparent !important; border: none !important; color: #666 !important; font-size: 10px !important; cursor: pointer !important; padding: 2px !important; line-height: 1 !important; }
+    .oa-input-update:hover:not(:disabled) { color: #00e676; }
+    .oa-input-update:disabled { color: #666; cursor: not-allowed; }
+    .oa-lots .oa-input-wrapper input { width: 70px !important; background: #111 !important; color: #fff !important; border: 1px solid #333 !important; border-radius: 4px !important; text-align: right !important; padding: 5px 18px 5px 5px !important; font-size: 10px !important; height: 24px !important; box-sizing: border-box !important; }
+    .oa-lots input.loading { text-align: center; }
+    .oa-light-theme .oa-lots .oa-input-wrapper input { background: #f0f0f0 !important; color: #222 !important; border-color: #ccc !important; }
+    .oa-light-theme .oa-lots input.editable { border-color: #3b82f6 !important; background: #fff !important; }
+    .oa-light-theme .oa-lots input[readonly]:hover { background: #e8e8e8 !important; }
     .price-wrapper { margin-right: 2px; }
-    .oa-price-input { width: 55px; background: #111; color: #fff; border: 1px solid #333; border-radius: 4px; padding: 5px 18px 5px 5px; text-align: right; font-size: 10px; }
+    .oa-price-input { width: 55px !important; background: #111 !important; color: #fff !important; border: 1px solid #333 !important; border-radius: 4px !important; padding: 5px 18px 5px 5px !important; text-align: right !important; font-size: 10px !important; height: 24px !important; box-sizing: border-box !important; }
     .oa-price-input:disabled { opacity: 0.5; }
-    
+    .netpos-wrapper { margin-right: 2px; }
+    /* Net pos button and input */
+    .oa-netpos-btn { background: #222 !important; color: #ccc !important; border: 1px solid #333 !important; border-radius: 4px !important; padding: 4px 6px !important; cursor: pointer !important; font-size: 11px !important; font-weight: 700 !important; white-space: nowrap !important; height: auto !important; width: auto !important; }
+    .oa-netpos-btn:hover { background: #333 !important; color: #fff !important; }
+    .oa-netpos-input-wrapper { position: relative !important; display: inline-flex !important; align-items: center !important; margin-left: 2px !important; }
+    .oa-netpos-input { width: 70px !important; background: #111 !important; color: #fff !important; border: 1px solid #333 !important; border-radius: 4px !important; padding: 5px 20px 5px 6px !important; text-align: right !important; font-size: 10px !important; height: 24px !important; box-sizing: border-box !important; }
+    .oa-netpos-label { position: absolute !important; right: 6px !important; top: 50% !important; transform: translateY(-50%) !important; color: #666 !important; font-size: 9px !important; font-weight: 700 !important; pointer-events: none !important; }
+    .oa-netpos-input.editable { border-color: #5c6bc0; background: #1a1a2e; }
+    .oa-netpos-input[readonly] { cursor: pointer; }
+    .oa-netpos-input[readonly]:hover { background: #1a1a2e; }
+
+    /* Light theme styles for net pos */
+    .oa-light-theme .oa-netpos-input { background: #f0f0f0 !important; color: #222 !important; border-color: #ccc !important; }
+    .oa-light-theme .oa-netpos-input.editable { border-color: #3b82f6 !important; background: #fff !important; }
+    .oa-light-theme .oa-netpos-input[readonly]:hover { background: #e8e8e8 !important; }
+    .oa-light-theme .oa-netpos-label { color: #999 !important; }
+
     /* Remove spinner arrows from number inputs */
     input[type="text"]::-webkit-outer-spin-button, input[type="text"]::-webkit-inner-spin-button,
     input[type="number"]::-webkit-outer-spin-button, input[type="number"]::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
     input[type="text"], input[type="number"] { -moz-appearance: textfield; }
     
-    .oa-order-btn { padding: 6px 12px; border: none; border-radius: 6px; font-weight: 700; cursor: pointer; text-transform: uppercase; font-size: 10px; white-space: nowrap; }
-    .oa-order-btn.buy { background: linear-gradient(135deg, #00c853, #00e676); color: #000; }
-    .oa-order-btn.sell { background: linear-gradient(135deg, #ff1744, #ff5252); color: #fff; }
+    .oa-order-btn { padding: 6px 12px !important; border: none !important; border-radius: 6px !important; font-weight: 700 !important; cursor: pointer !important; text-transform: uppercase !important; font-size: 10px !important; white-space: nowrap !important; height: auto !important; width: auto !important; }
+    .oa-order-btn.buy { background: linear-gradient(135deg, #00c853, #00e676) !important; color: #000 !important; }
+    .oa-order-btn.sell { background: linear-gradient(135deg, #ff1744, #ff5252) !important; color: #fff !important; }
+    .oa-resize-btn { padding: 6px 10px !important; border: none !important; border-radius: 6px !important; font-weight: 700 !important; cursor: pointer !important; font-size: 10px !important; white-space: nowrap !important; background: #222 !important; color: #eee !important; border: 1px solid #333 !important; height: auto !important; width: auto !important; }
+    .oa-resize-btn.neutral { background: #222 !important; color: #eee !important; }
+    .oa-resize-btn.buy { background: linear-gradient(135deg, #00c853, #00e676) !important; color: #000 !important; }
+    .oa-resize-btn.sell { background: linear-gradient(135deg, #ff1744, #ff5252) !important; color: #fff !important; }
+    .oa-light-theme .oa-resize-btn { background: #f0f0f0 !important; color: #222 !important; border-color: #ccc !important; }
+    .oa-light-theme .oa-resize-btn.buy { color: #000 !important; }
+    .oa-light-theme .oa-resize-btn.sell { color: #fff !important; }
     
     /* Strike dropdown - left aligned */
     .oa-strike-dropdown { position: absolute; top: 100%; left: 0; background: #000; border: 1px solid #222; border-radius: 6px; margin-top: 4px; max-height: 280px; overflow: hidden; z-index: 100; width: 240px; }
@@ -1569,7 +2168,15 @@ function injectStyles() {
     .oa-symbol-list { max-height: 80px; overflow-y: auto; margin-bottom: 6px; }
     .oa-symbol-item { display: flex; justify-content: space-between; align-items: center; padding: 4px 6px; background: #111; border-radius: 3px; margin-bottom: 3px; font-size: 10px; }
     .oa-symbol-info { flex: 1; }
-    .oa-symbol-actions { display: flex; gap: 4px; }
+    .oa-symbol-actions { display: flex; gap: 4px; align-items: center; }
+
+    /* Mode toggle switch */
+    .oa-mode-toggle { position: relative; display: inline-block; width: 36px; height: 18px; }
+    .oa-mode-switch { opacity: 0; width: 0; height: 0; }
+    .oa-mode-slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: #ccc; transition: .4s; border-radius: 18px; }
+    .oa-mode-slider:before { position: absolute; content: ""; height: 14px; width: 14px; left: 2px; bottom: 2px; background-color: white; transition: .4s; border-radius: 50%; }
+    .oa-mode-switch:checked + .oa-mode-slider { background-color: #5c6bc0; }
+    .oa-mode-switch:checked + .oa-mode-slider:before { transform: translateX(18px); }
     .oa-edit-symbol { background: transparent; border: none; cursor: pointer; font-size: 12px; padding: 2px; }
     .oa-remove-symbol { background: transparent; border: none; color: #ff5252; cursor: pointer; font-size: 12px; padding: 2px; }
     .oa-edit-form { background: #1a1a2e; padding: 8px; border-radius: 4px; margin-bottom: 8px; }
