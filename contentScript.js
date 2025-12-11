@@ -53,9 +53,16 @@ async function init() {
   applyTheme(state.theme);
   updateModeIndicator(); // Update mode indicator on init
   if (settings.uiMode === 'scalping' && settings.symbols?.length > 0 && settings.apiKey && settings.hostUrl) {
+    // Add loading animation to strike button during initial loading
+    const strikeBtn = document.getElementById('oa-strike-btn');
+    strikeBtn?.classList.add('oa-loading');
+
     state.fetchOpenPosAfterMargin = true; // Enable netposition fetch after first margin call during init
-    fetchExpiry(); // Fetch expiry on initial load
+    await fetchExpiry(); // Fetch expiry on initial load
     startDataRefresh();
+
+    // Remove loading animation after initial data loading
+    strikeBtn?.classList.remove('oa-loading');
   }
 }
 
@@ -772,7 +779,7 @@ function updateResizeButton() {
 
   const target = getTargetNetQty();
   const qtyModeIsQty = getQuantityMode() === 'quantity';
-  const displayQty = Math.abs(qtyModeIsQty ? target : toLots(target));
+  const displayQty = qtyModeIsQty ? target : toLots(target);
 
   btn.className = 'oa-resize-btn';
   btn.textContent = `Resize ${displayQty}`;
@@ -784,14 +791,7 @@ async function placeResize() {
   const symbol = getActiveSymbol();
   if (!symbol || !state.selectedSymbol) return showNotification('No symbol selected', 'error');
 
-  // Check if netpos quantity was auto-corrected and not manually verified
-  if (state.netposAutoCorrected) {
-    showNotification('Invalid qty - Adjusted to nearest valid lot. Please confirm and resize again.', 'error', 5000);
-    state.netposAutoCorrected = false;
-    return;
-  }
-
-  const targetQty = Math.max(0, getTargetNetQty()); // qty units for API
+  const targetQty = getTargetNetQty(); // qty units for API - can be negative
 
   const data = {
     strategy: 'Chrome',
@@ -800,8 +800,8 @@ async function placeResize() {
     action: state.action,
     product: symbol.productType,
     pricetype: 'MARKET',
-    quantity: String(targetQty),
-    position_size: String(targetQty),
+    quantity: '0', // Always use 0 for quantity
+    position_size: String(targetQty), // Use target position (can be negative)
     price: '0',
     trigger_price: '0'
   };
@@ -851,7 +851,7 @@ function initializeQuantityInput() {
     // Trigger validation and margin calculation
     const validationPassed = validateQuantity();
     if (validationPassed) {
-      fetchMargin();
+    fetchMargin();
     }
     updateResizeButton();
   }
@@ -911,36 +911,36 @@ function validateNetposQuantity() {
   // Don't validate if input is still in loading state
   if (netposEl.classList.contains('oa-loading')) return true;
 
-  let wasAutoCorrected = false;
-
   if (symbol.quantityMode === 'quantity') {
     // In quantity mode, check if the entered quantity is multiple of lot size
     const displayValue = parseInt(netposEl.value || '0', 10) || 0;
     const quantity = symbol.quantityMode === 'lots' ? displayValue * state.lotSize : displayValue;
 
-    if (quantity % state.lotSize !== 0) {
-      // Auto-reset to nearest valid multiple of lot size
-      const remainder = quantity % state.lotSize;
-      const lowerMultiple = quantity - remainder;
-      const upperMultiple = lowerMultiple + state.lotSize;
+    // Use absolute value for validation since position size represents magnitude
+    const absQuantity = Math.abs(quantity);
 
-      // Choose the nearest valid quantity
-      const validQuantity = (remainder <= state.lotSize / 2) ? lowerMultiple : upperMultiple;
+    if (absQuantity % state.lotSize !== 0) {
+      // Auto-reset to nearest valid multiple of lot size, preserving sign
+      const sign = quantity >= 0 ? 1 : -1;
+      const absRemainder = absQuantity % state.lotSize;
+      const absLowerMultiple = absQuantity - absRemainder;
+      const absUpperMultiple = absLowerMultiple + state.lotSize;
 
-      // Ensure we don't go below lot size
-      const finalValidQuantity = Math.max(state.lotSize, validQuantity);
+      // Choose the nearest valid absolute quantity
+      const absValidQuantity = (absRemainder <= state.lotSize / 2) ? absLowerMultiple : absUpperMultiple;
+
+      // For negative quantities, allow zero (to close position)
+      const finalValidQuantity = sign * absValidQuantity;
 
       // Update the input value and dataset
       const displayQty = symbol.quantityMode === 'lots' ? Math.floor(finalValidQuantity / state.lotSize) : finalValidQuantity;
       netposEl.value = displayQty.toString();
       netposEl.dataset.qty = finalValidQuantity.toString();
 
-      // Set auto-corrected flag to prevent automatic resize
-      state.netposAutoCorrected = true;
-      wasAutoCorrected = true;
-
       // Show notification with longer duration
       showNotification(`Warning invalid qty - Quantity reset to ${finalValidQuantity} (nearest valid multiple).`, 'error', 5000);
+
+      return false; // Quantity was invalid and auto-corrected
     }
   }
   // Keep display in sync for lots mode
@@ -950,12 +950,7 @@ function validateNetposQuantity() {
     netposEl.dataset.qty = qty.toString();
   }
 
-  // Reset auto-corrected flag only if no correction was made
-  if (!wasAutoCorrected) {
-    state.netposAutoCorrected = false;
-  }
-
-  return !wasAutoCorrected; // Return true if no correction was made
+  return true; // Quantity is valid
 }
 
 function updateExpirySlider() {
@@ -1057,22 +1052,24 @@ function updatePriceDisplay() {
   if (state.orderType === 'MARKET') {
     el.value = state.optionLtp.toFixed(2);
     el.disabled = true;
+    updateOrderButton();
+    fetchMargin(); // Fetch margin when price changes
   } else {
     el.disabled = false;
-    // Auto-update price to current strike LTP when strike is selected
-    state.price = state.optionLtp;
-    el.value = state.price.toFixed(2);
+    updateOrderButton();
   }
-  updateOrderButton();
-  fetchMargin(); // Fetch margin when price changes
 }
 
 function updateOrderButton() {
   const btn = document.getElementById('oa-order-btn');
   if (!btn) return;
-  const price = state.orderType === 'MARKET' ? state.optionLtp : state.price;
   const marginText = state.margin > 0 ? ` [₹${formatNumber(state.margin, 0)}]` : '';
-  btn.textContent = `${state.action} @ ${formatNumber(price)}${marginText}`;
+  if (state.orderType === 'MARKET') {
+    btn.textContent = `${state.action} @ MARKET${marginText}`;
+  } else {
+    const price = state.price;
+    btn.textContent = `${state.action} @ ${formatNumber(price)}${marginText}`;
+  }
   btn.className = `oa-order-btn ${state.action === 'BUY' ? 'buy' : 'sell'}`;
 }
 
@@ -1127,19 +1124,19 @@ function buildScalpingUI() {
         <button id="oa-lots-dec" class="oa-lot-btn" disabled>−</button>
         <div class="oa-input-wrapper">
           <input id="oa-lots" type="text" value="0" readonly>
-          <button id="oa-lots-update" class="oa-input-update" title="Update" disabled>↻</button>
+          <button id="oa-lots-update" class="oa-input-update" title="Set" disabled>↻</button>
         </div>
         <button id="oa-lots-inc" class="oa-lot-btn" disabled>+</button>
       </div>
       <button id="oa-ordertype-btn" class="oa-toggle oa-ordertype-fixed">${state.orderType}</button>
       <div class="oa-input-wrapper price-wrapper">
         <input id="oa-price" type="text" class="oa-price-input" value="0">
-        <button id="oa-price-update" class="oa-input-update" title="Update">↻</button>
+        <button id="oa-price-update" class="oa-input-update" title="Set">↻</button>
       </div>
       <button id="oa-order-btn" class="oa-order-btn buy">BUY @ --</button>
       <div class="oa-netpos-input-wrapper">
-        <input id="oa-netpos" type="text" class="oa-netpos-input" value="0" readonly>
         <span class="oa-netpos-label" title="Net Position">P</span>
+        <input id="oa-netpos" type="text" class="oa-netpos-input" value="0" readonly>
         <button id="oa-netpos-update" class="oa-input-update" title="Refresh Net Position">↻</button>
       </div>
       <button id="oa-resize-btn" class="oa-resize-btn neutral" title="Resize position">Resize</button>
@@ -1180,6 +1177,10 @@ function buildQuickUI() {
 function setupScalpingEvents(container) {
   // Symbol select - only fetch expiry when symbol changes
   container.querySelector('#oa-symbol-select')?.addEventListener('change', async (e) => {
+    // Add loading animation to strike button during symbol change
+    const strikeBtn = document.getElementById('oa-strike-btn');
+    strikeBtn?.classList.add('oa-loading');
+
     await saveSettings({ activeSymbolId: e.target.value });
     strikeChain = [];
     state.selectedExpiry = '';
@@ -1189,9 +1190,12 @@ function setupScalpingEvents(container) {
     updateModeIndicator(); // Update mode indicator for new symbol
     validateQuantity(); // Validate quantity for new symbol
     if (settings.apiKey && settings.hostUrl) {
-      fetchExpiry(); // Only fetch expiry on symbol change
+      await fetchExpiry(); // Only fetch expiry on symbol change
       startDataRefresh();
     }
+
+    // Remove loading animation after all data is loaded
+    strikeBtn?.classList.remove('oa-loading');
   });
 
   // Quantity mode toggle (click on mode indicator)
@@ -1247,7 +1251,7 @@ function setupScalpingEvents(container) {
       state.quantityAutoCorrected = false; // Reset flag on manual change
       const validationPassed = validateQuantity();
       if (validationPassed) {
-        fetchMargin();
+      fetchMargin();
       }
     }
   });
@@ -1259,14 +1263,14 @@ function setupScalpingEvents(container) {
     if (!symbol || !lotsInput || lotsInput.classList.contains('oa-loading')) return;
 
     const step = state.lotSize || 1;
-      state.lots += step;
-      syncQuantityInput();
-      state.quantityAutoCorrected = false; // Reset flag on manual change
+    state.lots += step;
+    syncQuantityInput();
+    state.quantityAutoCorrected = false; // Reset flag on manual change
       const validationPassed = validateQuantity();
       if (validationPassed) {
-        fetchMargin();
+    fetchMargin();
       }
-      updateResizeButton();
+    updateResizeButton();
   });
   // Qty input - handle click to enable editing (like netpos)
   container.querySelector('#oa-lots')?.addEventListener('click', (e) => {
@@ -1290,17 +1294,25 @@ function setupScalpingEvents(container) {
     if (e.target.classList.contains('oa-loading')) return;
 
     const symbol = getActiveSymbol();
-    const minDisplay = symbol ? (symbol.quantityMode === 'lots' ? 1 : (state.lotSize || 1)) : 1;
-    const newValue = Math.max(minDisplay, parseInt(e.target.value) || minDisplay);
-    setQuantityFromDisplay(newValue);
 
     // Reset auto-corrected flag when user manually changes quantity
     state.quantityAutoCorrected = false;
+
+    // Set the quantity first, then validate
+    const minDisplay = symbol ? (symbol.quantityMode === 'lots' ? 1 : (state.lotSize || 1)) : 1;
+    const parsedValue = parseInt(e.target.value) || minDisplay;
+    setQuantityFromDisplay(parsedValue);
 
     // Validate quantity in quantity mode
     let validationPassed = true;
     if (symbol && symbol.quantityMode === 'quantity') {
       validationPassed = validateQuantity();
+    }
+
+    // Re-apply minimum constraints after validation (in case validation changed the value)
+    if (state.lots < minDisplay) {
+      state.lots = minDisplay;
+      syncQuantityInput();
     }
 
     if (validationPassed) {
@@ -1357,7 +1369,7 @@ function setupScalpingEvents(container) {
       }
 
       if (validationPassed) {
-        fetchMargin();
+      fetchMargin();
       }
       updateResizeButton();
     }
@@ -1410,7 +1422,7 @@ function setupScalpingEvents(container) {
     const symbol = getActiveSymbol();
     if (netposEl && (netposEl.dataset.editing === 'true' || !netposEl.readOnly)) {
       // If user modified the quantity, commit the edited value
-      const newDisplayValue = Math.max(0, parseInt(netposEl.value) || 0);
+      const newDisplayValue = parseInt(netposEl.value) || 0; // Allow negative values
       const baseQty = symbol
         ? (symbol.quantityMode === 'lots' ? newDisplayValue * (state.lotSize || 1) : newDisplayValue)
         : newDisplayValue;
@@ -1433,12 +1445,14 @@ function setupScalpingEvents(container) {
 
   // Resize button
   container.querySelector('#oa-resize-btn')?.addEventListener('click', () => {
-    // Validate netpos quantity before placing resize order
-    const validationPassed = validateNetposQuantity();
-    // Only place resize if validation passed
-    if (validationPassed) {
-      placeResize();
+    // Check if netpos quantity is valid, if not reset to valid qty with warning and return
+    const isValid = validateNetposQuantity();
+    if (!isValid) {
+      // Quantity was auto-corrected, warning shown, don't place order
+      return;
     }
+    // Quantity is valid, place resize
+    placeResize();
   });
 
   // Order button
@@ -1452,8 +1466,8 @@ function setupScalpingEvents(container) {
 
     // Only place order if validation passed
     if (validationPassed) {
-      if (state.useMoneyness) placeOptionsOrder();
-      else placePlaceOrder();
+    if (state.useMoneyness) placeOptionsOrder();
+    else placePlaceOrder();
     }
   });
 
@@ -2082,14 +2096,14 @@ function injectStyles() {
     .oa-netpos-btn { background: #222 !important; color: #ccc !important; border: 1px solid #333 !important; border-radius: 4px !important; padding: 4px 6px !important; cursor: pointer !important; font-size: 11px !important; font-weight: 700 !important; white-space: nowrap !important; height: auto !important; width: auto !important; }
     .oa-netpos-btn:hover { background: #333 !important; color: #fff !important; }
     .oa-netpos-input-wrapper { position: relative !important; display: inline-flex !important; align-items: center !important; margin-left: 2px !important; }
-    .oa-netpos-input { width: 70px !important; background: #111 !important; color: #fff !important; border: 1px solid #333 !important; border-radius: 4px !important; padding: 5px 20px 5px 6px !important; text-align: right !important; font-size: 10px !important; height: 24px !important; box-sizing: border-box !important; }
-    .oa-netpos-label { position: absolute !important; right: 6px !important; top: 50% !important; transform: translateY(-50%) !important; color: #666 !important; font-size: 9px !important; font-weight: 700 !important; pointer-events: none !important; }
+    .oa-netpos-input { width: 70px !important; background: #111 !important; color: #fff !important; border: 1px solid #333 !important; border-radius: 4px !important; padding: 5px 20px 5px 18px !important; text-align: right !important; font-size: 10px !important; height: 24px !important; box-sizing: border-box !important; }
+    .oa-netpos-label { position: absolute !important; left: 6px !important; top: 50% !important; transform: translateY(-50%) !important; color: #666 !important; font-size: 12px !important; font-weight: 700 !important; pointer-events: auto !important; }
     .oa-netpos-input.editable { border-color: #5c6bc0; background: #1a1a2e; }
     .oa-netpos-input[readonly] { cursor: pointer; }
-    .oa-netpos-input[readonly]:hover { background: #1a1a2e; }
+    .oa-netpos-input[readonly]:hover { background: #1a1a2e !important; }
 
     /* Light theme styles for net pos */
-    .oa-light-theme .oa-netpos-input { background: #f0f0f0 !important; color: #222 !important; border-color: #ccc !important; }
+    .oa-light-theme .oa-netpos-input { background: #f0f0f0 !important; color: #222 !important; border-color: #ccc !important; padding: 5px 20px 5px 18px !important; }
     .oa-light-theme .oa-netpos-input.editable { border-color: #3b82f6 !important; background: #fff !important; }
     .oa-light-theme .oa-netpos-input[readonly]:hover { background: #e8e8e8 !important; }
     .oa-light-theme .oa-netpos-label { color: #999 !important; }
