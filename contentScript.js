@@ -1,4 +1,4 @@
-// OpenAlgo Options Scalping Extension v2.3
+// OpenAlgo Options Scalping Extension v2.4
 // Global state
 let state = {
   action: 'BUY',
@@ -22,13 +22,13 @@ let state = {
   theme: 'dark',
   refreshMode: 'auto',
   refreshIntervalSec: 5,
-  rateLimit: 100, // Delay between API calls in ms
   refreshAreas: { funds: true, underlying: true, selectedStrike: true },
   loading: { funds: false, underlying: false, strikes: false, margin: false },
-  quantityAutoCorrected: false, // Flag to track if quantity was auto-corrected
-  netposAutoCorrected: false, // Flag to track if netpos quantity was auto-corrected
   fetchOpenPosAfterMargin: false,
-  currentNetQty: 0 // actual net position quantity (in qty units)
+  currentNetQty: 0, // actual net position quantity (in qty units)
+  // WebSocket state
+  liveDataEnabled: false,
+  wsUrl: 'ws://127.0.0.1:8765'
 };
 
 let isInitialized = false;
@@ -36,6 +36,11 @@ let isInitialized = false;
 let expiryList = [];
 let strikeChain = [];
 let settings = {};
+
+// WebSocket connection
+let ws = null;
+let wsSubscriptions = { underlying: null, strike: null };
+let wsReconnectTimer = null;
 let refreshInterval = null;
 
 // Initialize on load
@@ -63,20 +68,28 @@ async function init() {
 
     // Remove loading animation after initial data loading
     strikeBtn?.classList.remove('oa-loading');
+
+    // Auto-connect WebSocket if live data is enabled
+    if (state.liveDataEnabled && state.wsUrl) {
+      wsConnect();
+      // Wait for connection before subscribing
+      setTimeout(() => updateWsSubscriptions(), 1500);
+    }
   }
 }
 
 // Load settings from chrome storage
 function loadSettings() {
   return new Promise((resolve) => {
-    chrome.storage.sync.get(['hostUrl', 'apiKey', 'symbols', 'activeSymbolId', 'uiMode', 'symbol', 'exchange', 'product', 'quantity', 'theme', 'refreshMode', 'refreshIntervalSec', 'refreshAreas', 'strikeMode', 'rateLimit'], (data) => {
+    chrome.storage.sync.get(['hostUrl', 'apiKey', 'symbols', 'activeSymbolId', 'uiMode', 'symbol', 'exchange', 'product', 'quantity', 'theme', 'refreshMode', 'refreshIntervalSec', 'refreshAreas', 'strikeMode', 'wsUrl', 'liveDataEnabled'], (data) => {
       state.theme = data.theme || 'dark';
       state.refreshMode = data.refreshMode || 'auto';
       state.refreshIntervalSec = data.refreshIntervalSec || 5;
-      state.rateLimit = data.rateLimit || 100;
       state.refreshAreas = data.refreshAreas || { funds: true, underlying: true, selectedStrike: true };
       state.strikeMode = data.strikeMode || 'moneyness';
       state.useMoneyness = state.strikeMode === 'moneyness';
+      state.wsUrl = data.wsUrl || 'ws://127.0.0.1:8765';
+      state.liveDataEnabled = data.liveDataEnabled || false;
 
       // Default symbols if none exist
       let symbols = data.symbols || [];
@@ -86,8 +99,7 @@ function loadSettings() {
           symbol: 'NIFTY',
           exchange: 'NSE_INDEX',
           optionExchange: 'NFO',
-          productType: 'MIS',
-          quantityMode: 'lots' // 'lots' or 'quantity'
+          productType: 'MIS'
         }];
       }
 
@@ -137,10 +149,9 @@ function deriveOptionExchange(exchange) {
   return 'NFO';
 }
 
-// Quantity helpers
+// Quantity helpers - Lots mode only
 function getQuantityMode() {
-  const symbol = getActiveSymbol();
-  return symbol?.quantityMode || 'lots';
+  return 'lots'; // Always lots mode
 }
 
 function toLots(quantity) {
@@ -153,17 +164,14 @@ function toLots(quantity) {
 
 function toQuantity(displayValue) {
   const normalized = Math.max(1, parseInt(displayValue, 10) || 1);
-  if (getQuantityMode() === 'lots') {
-    return state.lotSize ? normalized * state.lotSize : normalized;
-  }
-  return normalized;
+  // Always lots mode: display value is lots, convert to quantity
+  return state.lotSize ? normalized * state.lotSize : normalized;
 }
 
 function getDisplayQuantity(quantity = state.lots) {
   if (!quantity) return 0;
-  return getQuantityMode() === 'lots'
-    ? toLots(quantity)
-    : quantity;
+  // Always display in lots
+  return toLots(quantity);
 }
 
 function getApiQuantity() {
@@ -178,10 +186,10 @@ function syncQuantityInput() {
   const displayValue = getDisplayQuantity();
   lotsInput.value = displayValue ? displayValue.toString() : '0';
   lotsInput.classList.remove('loading');
-    if (document.body.classList.contains('oa-light-theme')) {
-      lotsInput.style.background = '#f0f0f0';
-      lotsInput.style.color = '#222';
-    }
+  if (document.body.classList.contains('oa-light-theme')) {
+    lotsInput.style.background = '#f0f0f0';
+    lotsInput.style.color = '#222';
+  }
 }
 
 function setQuantityFromDisplay(displayValue) {
@@ -219,52 +227,210 @@ async function apiCall(endpoint, data) {
   }
 }
 
-// Rate limiter - queue-based to handle concurrent requests properly
-let apiCallQueue = [];
-let isProcessingQueue = false;
-
-async function rateLimitedApiCall(endpoint, data) {
-  return new Promise((resolve, reject) => {
-    apiCallQueue.push({ endpoint, data, resolve, reject });
-    processApiQueue();
-  });
+// Debounce utility - delays execution and cancels previous pending calls
+const debounceTimers = {};
+function debounce(fn, delay, key) {
+  return function (...args) {
+    clearTimeout(debounceTimers[key]);
+    debounceTimers[key] = setTimeout(() => fn.apply(this, args), delay);
+  };
 }
 
-async function processApiQueue() {
-  if (isProcessingQueue || apiCallQueue.length === 0) return;
+// Create debounced versions of data-fetching functions
+const debouncedFetchMargin = debounce(() => _fetchMargin(), 200, 'margin');
+const debouncedFetchUnderlyingQuote = debounce(() => _fetchUnderlyingQuote(), 300, 'underlying');
+const debouncedFetchFunds = debounce(() => _fetchFunds(), 300, 'funds');
+const debouncedFetchOpenPosition = debounce(() => _fetchOpenPosition(), 200, 'openpos');
+const debouncedFetchStrikeLTPs = debounce(() => _fetchStrikeLTPs(), 200, 'strikeltps');
 
-  isProcessingQueue = true;
+// ============ WebSocket Functions ============
 
-  while (apiCallQueue.length > 0) {
-    const { endpoint, data, resolve, reject } = apiCallQueue.shift();
-
-    try {
-      const result = await apiCall(endpoint, data);
-      resolve(result);
-
-      // Wait for rate limit delay before processing next call
-      if (apiCallQueue.length > 0) {
-        await new Promise(r => setTimeout(r, state.rateLimit));
-      }
-    } catch (error) {
-      reject(error);
-    }
-  }
-
-  isProcessingQueue = false;
-}
-
-// Fetch margin for current order
-async function fetchMargin() {
-  const symbol = getActiveSymbol();
-  if (!symbol || !state.selectedSymbol) return;
-
-  // Don't fetch margin if quantity is invalid in quantity mode
-  if (symbol.quantityMode === 'quantity' && getApiQuantity() % state.lotSize !== 0) {
-    state.margin = 0;
-    updateOrderButton();
+// Connect to WebSocket server
+function wsConnect() {
+  if (ws && ws.readyState === WebSocket.OPEN) return;
+  if (!state.wsUrl || !settings.apiKey) {
+    console.log('WebSocket: Missing URL or API key');
     return;
   }
+
+  try {
+    ws = new WebSocket(state.wsUrl);
+
+    ws.onopen = () => {
+      console.log('WebSocket: Connected');
+      // Authenticate
+      ws.send(JSON.stringify({ action: 'authenticate', api_key: settings.apiKey }));
+    };
+
+    ws.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        handleWsMessage(data);
+      } catch (e) {
+        console.error('WebSocket: Parse error', e);
+      }
+    };
+
+    ws.onclose = () => {
+      console.log('WebSocket: Disconnected');
+      ws = null;
+      // Auto-reconnect if still enabled
+      if (state.liveDataEnabled) {
+        clearTimeout(wsReconnectTimer);
+        wsReconnectTimer = setTimeout(() => wsConnect(), 5000);
+      }
+    };
+
+    ws.onerror = (error) => {
+      console.error('WebSocket: Error', error);
+    };
+  } catch (e) {
+    console.error('WebSocket: Connection failed', e);
+  }
+}
+
+// Disconnect from WebSocket server
+function wsDisconnect() {
+  clearTimeout(wsReconnectTimer);
+  if (ws) {
+    ws.close();
+    ws = null;
+  }
+  wsSubscriptions = { underlying: null, strike: null };
+}
+
+// Subscribe to a symbol for LTP updates
+function wsSubscribe(symbol, exchange, type) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+  const key = type === 'underlying' ? 'underlying' : 'strike';
+
+  // Unsubscribe from previous if different
+  if (wsSubscriptions[key] && wsSubscriptions[key].symbol !== symbol) {
+    wsUnsubscribe(wsSubscriptions[key].symbol, wsSubscriptions[key].exchange, type);
+  }
+
+  ws.send(JSON.stringify({
+    action: 'subscribe',
+    symbol: symbol,
+    exchange: exchange,
+    mode: 1 // LTP mode
+  }));
+
+  wsSubscriptions[key] = { symbol, exchange };
+}
+
+// Unsubscribe from a symbol
+function wsUnsubscribe(symbol, exchange, type) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+  ws.send(JSON.stringify({
+    action: 'unsubscribe',
+    symbol: symbol,
+    exchange: exchange,
+    mode: 1
+  }));
+
+  const key = type === 'underlying' ? 'underlying' : 'strike';
+  wsSubscriptions[key] = null;
+}
+
+// Pending WebSocket updates - use requestAnimationFrame to throttle UI updates
+let pendingWsUpdate = { underlying: null, strike: null };
+let wsRafScheduled = false;
+
+// Handle WebSocket messages
+function handleWsMessage(data) {
+  // Handle market data
+  if (data.type === 'market_data' && data.data) {
+    const symbol = getActiveSymbol();
+    if (!symbol) return;
+
+    // Check if this is underlying update
+    if (wsSubscriptions.underlying &&
+      data.data.symbol === wsSubscriptions.underlying.symbol) {
+      pendingWsUpdate.underlying = data.data.ltp;
+    }
+
+    // Check if this is strike update (only in MARKET mode)
+    if (state.orderType === 'MARKET' &&
+      wsSubscriptions.strike &&
+      data.data.symbol === wsSubscriptions.strike.symbol) {
+      pendingWsUpdate.strike = data.data.ltp;
+    }
+
+    // Schedule update via requestAnimationFrame to avoid overloading
+    if (!wsRafScheduled) {
+      wsRafScheduled = true;
+      requestAnimationFrame(() => {
+        applyPendingWsUpdates();
+        wsRafScheduled = false;
+      });
+    }
+  }
+}
+
+// Apply pending WebSocket updates to UI
+function applyPendingWsUpdates() {
+  // Update underlying
+  if (pendingWsUpdate.underlying !== null) {
+    state.underlyingLtp = pendingWsUpdate.underlying;
+    updateUnderlyingDisplay();
+    pendingWsUpdate.underlying = null;
+  }
+
+  // Update strike price (MARKET mode only)
+  if (pendingWsUpdate.strike !== null && state.orderType === 'MARKET') {
+    state.optionLtp = pendingWsUpdate.strike;
+    const priceEl = document.getElementById('oa-price');
+    if (priceEl) {
+      priceEl.value = state.optionLtp.toFixed(2);
+      updateOrderButton();
+    }
+    pendingWsUpdate.strike = null;
+  }
+}
+
+// Update WebSocket subscriptions based on current state
+function updateWsSubscriptions() {
+  if (!state.liveDataEnabled || !ws || ws.readyState !== WebSocket.OPEN) return;
+
+  const symbol = getActiveSymbol();
+  if (!symbol) return;
+
+  // Subscribe to underlying
+  wsSubscribe(symbol.symbol, symbol.exchange, 'underlying');
+
+  // Subscribe to strike only in MARKET mode
+  if (state.orderType === 'MARKET' && state.selectedSymbol) {
+    const selected = strikeChain.find(s => s.offset === state.selectedOffset);
+    if (selected) {
+      wsSubscribe(selected.symbol, selected.exchange, 'strike');
+    }
+  } else if (wsSubscriptions.strike) {
+    // Unsubscribe from strike if not in MARKET mode
+    wsUnsubscribe(wsSubscriptions.strike.symbol, wsSubscriptions.strike.exchange, 'strike');
+  }
+}
+
+// Toggle live data
+function toggleLiveData(enable) {
+  state.liveDataEnabled = enable;
+  saveSettings({ liveDataEnabled: enable });
+
+  if (enable) {
+    wsConnect();
+    // Wait for connection before subscribing
+    setTimeout(() => updateWsSubscriptions(), 1000);
+  } else {
+    wsDisconnect();
+  }
+}
+
+// Fetch margin for current order - internal implementation
+async function _fetchMargin() {
+  const symbol = getActiveSymbol();
+  if (!symbol || !state.selectedSymbol) return;
 
   const price = state.orderType === 'MARKET' ? state.optionLtp : state.price;
   if (!price) return;
@@ -272,7 +438,7 @@ async function fetchMargin() {
   const quantity = getApiQuantity();
 
   state.loading.margin = true;
-  const result = await rateLimitedApiCall('/api/v1/margin', {
+  const result = await apiCall('/api/v1/margin', {
     positions: [{
       symbol: state.selectedSymbol,
       exchange: symbol.optionExchange,
@@ -295,13 +461,18 @@ async function fetchMargin() {
   }
 }
 
-// Fetch quotes for underlying
-async function fetchUnderlyingQuote() {
+// Public wrapper - uses debounce
+function fetchMargin() {
+  debouncedFetchMargin();
+}
+
+// Fetch quotes for underlying - internal implementation
+async function _fetchUnderlyingQuote() {
   const symbol = getActiveSymbol();
   if (!symbol) return;
   state.loading.underlying = true;
   showLoadingIndicator('underlying');
-  const result = await rateLimitedApiCall('/api/v1/quotes', { symbol: symbol.symbol, exchange: symbol.exchange });
+  const result = await apiCall('/api/v1/quotes', { symbol: symbol.symbol, exchange: symbol.exchange });
   state.loading.underlying = false;
   hideLoadingIndicator('underlying');
   if (result.status === 'success' && result.data) {
@@ -311,11 +482,16 @@ async function fetchUnderlyingQuote() {
   }
 }
 
-// Fetch funds
-async function fetchFunds() {
+// Public wrapper - uses debounce
+function fetchUnderlyingQuote() {
+  debouncedFetchUnderlyingQuote();
+}
+
+// Fetch funds - internal implementation
+async function _fetchFunds() {
   state.loading.funds = true;
   showLoadingIndicator('funds');
-  const result = await rateLimitedApiCall('/api/v1/funds', {});
+  const result = await apiCall('/api/v1/funds', {});
   state.loading.funds = false;
   hideLoadingIndicator('funds');
   if (result.status === 'success' && result.data) {
@@ -327,12 +503,17 @@ async function fetchFunds() {
   }
 }
 
-// Fetch open position for current symbol
-async function fetchOpenPosition() {
+// Public wrapper - uses debounce
+function fetchFunds() {
+  debouncedFetchFunds();
+}
+
+// Fetch open position for current symbol - internal implementation
+async function _fetchOpenPosition() {
   const symbol = getActiveSymbol();
   if (!symbol || !state.selectedSymbol) return;
 
-  const result = await rateLimitedApiCall('/api/v1/openposition', {
+  const result = await apiCall('/api/v1/openposition', {
     strategy: 'Chrome',
     symbol: state.selectedSymbol,
     exchange: symbol.optionExchange,
@@ -340,9 +521,25 @@ async function fetchOpenPosition() {
   });
 
   if (result.status === 'success') {
+    // Convert qty to lots for display
     const quantity = parseInt(result.quantity) || 0;
     updateNetPosDisplay(quantity);
+
+    // Reset netpos input editing state and update resize button to show 0
+    const netposEl = document.getElementById('oa-netpos');
+    if (netposEl) {
+      netposEl.dataset.editing = 'false';
+      netposEl.dataset.qty = quantity.toString();
+      netposEl.value = toLots(quantity).toString(); // Sync display value
+    }
+    // Reset resize button to show 0 change (target = current)
+    updateResizeButton();
   }
+}
+
+// Public wrapper - uses debounce
+function fetchOpenPosition() {
+  debouncedFetchOpenPosition();
 }
 
 // Fetch expiry list
@@ -352,7 +549,7 @@ async function fetchExpiry() {
 
   const symbol = getActiveSymbol();
   if (!symbol) return;
-  const result = await rateLimitedApiCall('/api/v1/expiry', {
+  const result = await apiCall('/api/v1/expiry', {
     symbol: symbol.symbol,
     exchange: symbol.optionExchange,
     instrumenttype: 'options'
@@ -366,14 +563,16 @@ async function fetchExpiry() {
     // Auto-fetch strike chain after expiry is loaded
     if (state.selectedExpiry) {
       await fetchStrikeChain();
-      // Remove redundant refreshSelectedStrike() - fetchStrikeChain -> updateSelectedOptionLTP -> updatePriceDisplay -> fetchMargin handles it
     }
   }
 }
 
-// Fetch strike chain using optionsymbol API
+// Fetch strike chain using optionsymbol API - OPTIMIZED
+// Only fetches ATM and ITM1, calculates strike interval, builds rest dynamically
 let isFetchingStrikeChain = false;
 let isExtendingStrikes = false;
+let strikeInterval = 0; // Calculated from |ATM - ITM1|
+let cachedATMStrike = 0; // Cache ATM strike for CE/PE switching
 
 async function fetchStrikeChain() {
   // Prevent concurrent executions
@@ -386,71 +585,168 @@ async function fetchStrikeChain() {
     return;
   }
 
-  // Build offsets dynamically based on current extend level
-  const offsets = [];
-  for (let i = state.extendLevel; i >= 1; i--) {
-    offsets.push(`ITM${i}`);
-  }
-  offsets.push('ATM');
-  for (let i = 1; i <= state.extendLevel; i++) {
-    offsets.push(`OTM${i}`);
-  }
-
   state.loading.strikes = true;
   showLoadingIndicator('strikes');
 
   try {
-    // Make API calls sequentially to respect rate limits
-    const results = [];
-    for (const offset of offsets) {
-      const result = await rateLimitedApiCall('/api/v1/optionsymbol', {
+    // Only fetch ATM and ITM1 via API to calculate strike interval
+    const [atmResult, itm1Result] = await Promise.all([
+      apiCall('/api/v1/optionsymbol', {
         strategy: 'Chrome',
         underlying: symbol.symbol,
         exchange: symbol.exchange,
         expiry_date: state.selectedExpiry,
-        offset: offset,
+        offset: 'ATM',
         option_type: state.optionType
-      });
-      results.push(result);
+      }),
+      apiCall('/api/v1/optionsymbol', {
+        strategy: 'Chrome',
+        underlying: symbol.symbol,
+        exchange: symbol.exchange,
+        expiry_date: state.selectedExpiry,
+        offset: 'ITM1',
+        option_type: state.optionType
+      })
+    ]);
+
+    if (atmResult.status !== 'success' || itm1Result.status !== 'success') {
+      console.error('Failed to fetch ATM/ITM1 strikes');
+      isFetchingStrikeChain = false;
+      state.loading.strikes = false;
+      hideLoadingIndicator('strikes');
+      return;
     }
-  strikeChain = offsets.map((offset, i) => {
-    const r = results[i];
-    if (r.status === 'success') {
-      // Parse strike from option symbol format: [BaseSymbol][DDMMMYY][Strike][CE/PE]
-      const strikeMatch = r.symbol.match(/^[A-Z]+(?:\d{2}[A-Z]{3}\d{2})(\d+)(?=CE$|PE$)/);
-      return {
-        offset,
-        symbol: r.symbol,
-        exchange: r.exchange || symbol.optionExchange,
-        strike: strikeMatch ? parseInt(strikeMatch[1]) : 0,
-        lotsize: r.lotsize || 25,
+
+    // Parse strikes from symbols
+    const atmStrikeMatch = atmResult.symbol.match(/^[A-Z]+(?:\d{2}[A-Z]{3}\d{2})(\d+)(?=CE$|PE$)/);
+    const itm1StrikeMatch = itm1Result.symbol.match(/^[A-Z]+(?:\d{2}[A-Z]{3}\d{2})(\d+)(?=CE$|PE$)/);
+
+    const atmStrike = atmStrikeMatch ? parseInt(atmStrikeMatch[1]) : 0;
+    const itm1Strike = itm1StrikeMatch ? parseInt(itm1StrikeMatch[1]) : 0;
+
+    // Calculate strike interval (absolute difference - just the gap between strikes)
+    strikeInterval = Math.abs(atmStrike - itm1Strike);
+    cachedATMStrike = atmStrike;
+
+    // Store lotsize from ATM (applies to all strikes for this underlying)
+    state.lotSize = atmResult.lotsize || 25;
+
+    // Build strike chain dynamically
+    // For CE: ITM is below ATM (lower strike), OTM is above ATM (higher strike)
+    // For PE: ITM is above ATM (higher strike), OTM is below ATM (lower strike)
+    const isPE = state.optionType === 'PE';
+    const itmDirection = isPE ? 1 : -1;  // PE: ITM is higher (+), CE: ITM is lower (-)
+    const otmDirection = isPE ? -1 : 1;  // PE: OTM is lower (-), CE: OTM is higher (+)
+
+    strikeChain = [];
+
+    // Build ITM strikes (ITM5 to ITM1)
+    for (let i = state.extendLevel; i >= 1; i--) {
+      const strike = atmStrike + (i * strikeInterval * itmDirection);
+      strikeChain.push({
+        offset: `ITM${i}`,
+        symbol: `${symbol.symbol}${state.selectedExpiry}${strike}${state.optionType}`,
+        exchange: atmResult.exchange || symbol.optionExchange,
+        strike: strike,
+        lotsize: state.lotSize,
         ltp: 0,
         prevClose: 0
-      };
+      });
     }
-    return null;
-  }).filter(Boolean);
 
-  // Store lotsize from ATM
-  const atmStrike = strikeChain.find(s => s.offset === 'ATM');
-  if (atmStrike) {
-    state.lotSize = atmStrike.lotsize;
+    // Add ATM (from API response)
+    strikeChain.push({
+      offset: 'ATM',
+      symbol: atmResult.symbol,
+      exchange: atmResult.exchange || symbol.optionExchange,
+      strike: atmStrike,
+      lotsize: state.lotSize,
+      ltp: 0,
+      prevClose: 0
+    });
+
+    // Build OTM strikes (OTM1 to OTM5)
+    for (let i = 1; i <= state.extendLevel; i++) {
+      const strike = atmStrike + (i * strikeInterval * otmDirection);
+      strikeChain.push({
+        offset: `OTM${i}`,
+        symbol: `${symbol.symbol}${state.selectedExpiry}${strike}${state.optionType}`,
+        exchange: atmResult.exchange || symbol.optionExchange,
+        strike: strike,
+        lotsize: state.lotSize,
+        ltp: 0,
+        prevClose: 0
+      });
+    }
+
     // Initialize quantity input now that we know the lot size
     initializeQuantityInput();
-  }
 
-  // Fetch LTPs for all strikes
-  await fetchStrikeLTPs();
+    // Fetch LTPs for all strikes
+    await _fetchStrikeLTPs();
   } finally {
     isFetchingStrikeChain = false;
   }
 }
 
-// Fetch LTPs for strike chain
-async function fetchStrikeLTPs() {
+// Switch CE/PE without API call - just swap offset meanings and rebuild symbols
+async function switchOptionType() {
+  if (!strikeInterval || !cachedATMStrike) {
+    // No cached data, need full fetch
+    await fetchStrikeChain();
+    return;
+  }
+
+  const symbol = getActiveSymbol();
+  if (!symbol) return;
+
+  // Rebuild strike chain with swapped option type and flipped ITM/OTM
+  const newChain = [];
+
+  // When switching CE to PE (or vice versa), ITM becomes OTM and OTM becomes ITM
+  // ATM stays the same
+  for (const item of strikeChain) {
+    let newOffset = item.offset;
+
+    // Flip ITM <-> OTM (ATM stays same)
+    if (item.offset.startsWith('ITM')) {
+      const level = item.offset.replace('ITM', '');
+      newOffset = `OTM${level}`;
+    } else if (item.offset.startsWith('OTM')) {
+      const level = item.offset.replace('OTM', '');
+      newOffset = `ITM${level}`;
+    }
+
+    newChain.push({
+      offset: newOffset,
+      symbol: `${symbol.symbol}${state.selectedExpiry}${item.strike}${state.optionType}`,
+      exchange: item.exchange,
+      strike: item.strike,
+      lotsize: item.lotsize,
+      ltp: 0,
+      prevClose: 0
+    });
+  }
+
+  // Sort chain by offset (ITM5...ITM1, ATM, OTM1...OTM5)
+  strikeChain = newChain.sort((a, b) => {
+    const getOrder = (offset) => {
+      if (offset === 'ATM') return 0;
+      const level = parseInt(offset.replace(/[A-Z]/g, ''));
+      return offset.startsWith('ITM') ? -level : level;
+    };
+    return getOrder(a.offset) - getOrder(b.offset);
+  });
+
+  // Only fetch new LTPs, no optionsymbol API call needed
+  await _fetchStrikeLTPs();
+}
+
+// Fetch LTPs for strike chain - internal implementation
+async function _fetchStrikeLTPs() {
   if (strikeChain.length === 0) return;
   const symbols = strikeChain.map(s => ({ symbol: s.symbol, exchange: s.exchange }));
-  const result = await rateLimitedApiCall('/api/v1/multiquotes', { symbols });
+  const result = await apiCall('/api/v1/multiquotes', { symbols });
 
   if (result.status === 'success' && result.results) {
     result.results.forEach(r => {
@@ -467,6 +763,11 @@ async function fetchStrikeLTPs() {
   updateSelectedOptionLTP();
 }
 
+// Public wrapper - uses debounce
+function fetchStrikeLTPs() {
+  debouncedFetchStrikeLTPs();
+}
+
 // Update selected option LTP display
 function updateSelectedOptionLTP() {
   const selected = strikeChain.find(s => s.offset === state.selectedOffset);
@@ -478,6 +779,8 @@ function updateSelectedOptionLTP() {
     state.selectedSymbol = selected.symbol;
     updatePriceDisplay();
     updateStrikeButton();
+    fetchMargin(); // Auto-fetch margin when strike changes
+    updateWsSubscriptions(); // Update WebSocket subscriptions for new strike
   }
 }
 
@@ -485,18 +788,6 @@ function updateSelectedOptionLTP() {
 async function placeOptionsOrder() {
   const symbol = getActiveSymbol();
   if (!symbol) return showNotification('No symbol selected', 'error');
-
-  // Check if quantity was auto-corrected and not manually verified
-  if (state.quantityAutoCorrected) {
-    showNotification('Invalid qty - Adjusted to nearest valid lot. Please confirm and place again.', 'error', 5000);
-    state.quantityAutoCorrected = false;
-    return;
-  }
-
-  // Check quantity validation in quantity mode
-  if (symbol.quantityMode === 'quantity' && state.lots % state.lotSize !== 0) {
-    return showNotification(`Quantity must be multiple of ${state.lotSize} (lot size)`, 'error');
-  }
 
   const quantity = getApiQuantity();
 
@@ -524,18 +815,6 @@ async function placePlaceOrder() {
   const symbol = getActiveSymbol();
   const selected = strikeChain.find(s => s.offset === state.selectedOffset);
   if (!symbol || !selected) return showNotification('No strike selected', 'error');
-
-  // Check if quantity was auto-corrected and not manually verified
-  if (state.quantityAutoCorrected) {
-    showNotification('Invalid qty - Adjusted to nearest valid lot. Please confirm and place again.', 'error', 5000);
-    state.quantityAutoCorrected = false;
-    return;
-  }
-
-  // Check quantity validation in quantity mode
-  if (symbol.quantityMode === 'quantity' && state.lots % state.lotSize !== 0) {
-    return showNotification(`Quantity must be multiple of ${state.lotSize} (lot size)`, 'error');
-  }
 
   const quantity = getApiQuantity();
 
@@ -609,12 +888,22 @@ function makeLegacyApiCall(url, data, actionText) {
 }
 
 // Start data refresh interval (expiry only on init, not in interval)
+let isInitialLoad = true;
 function startDataRefresh() {
   // Don't start data refresh if API credentials are not configured
   if (!settings.apiKey || !settings.hostUrl) return;
 
-  if (state.refreshAreas.underlying) fetchUnderlyingQuote();
-  if (state.refreshAreas.funds) fetchFunds();
+  // On initial load, always fetch data regardless of checkbox settings
+  if (isInitialLoad) {
+    fetchUnderlyingQuote();
+    fetchFunds();
+    isInitialLoad = false;
+  } else {
+    // Subsequent refreshes respect checkbox settings
+    if (state.refreshAreas.underlying) fetchUnderlyingQuote();
+    if (state.refreshAreas.funds) fetchFunds();
+  }
+
   // Don't fetch expiry here - only on symbol change and initial load
   if (refreshInterval) clearInterval(refreshInterval);
   if (state.refreshMode === 'auto') {
@@ -644,7 +933,7 @@ async function refreshSelectedStrike() {
 
   // In moneyness mode, get latest strike from optionsymbol API first
   if (state.strikeMode === 'moneyness' && state.selectedExpiry) {
-    const symbolResult = await rateLimitedApiCall('/api/v1/optionsymbol', {
+    const symbolResult = await apiCall('/api/v1/optionsymbol', {
       strategy: 'Chrome',
       underlying: symbol.symbol,
       exchange: symbol.exchange,
@@ -671,7 +960,7 @@ async function refreshSelectedStrike() {
   // Now fetch quote for the selected strike
   const selected = strikeChain.find(s => s.offset === state.selectedOffset);
   if (selected) {
-    const result = await rateLimitedApiCall('/api/v1/quotes', { symbol: selected.symbol, exchange: selected.exchange });
+    const result = await apiCall('/api/v1/quotes', { symbol: selected.symbol, exchange: selected.exchange });
     if (result.status === 'success' && result.data) {
       selected.ltp = result.data.ltp || 0;
       selected.prevClose = result.data.prev_close || 0;
@@ -718,12 +1007,10 @@ function updateFundsDisplay(available, todayPL) {
 
 function updateNetPosDisplay(quantity) {
   const el = document.getElementById('oa-netpos');
-  const symbol = getActiveSymbol();
-  if (el && symbol) {
+  if (el) {
     state.currentNetQty = quantity;
-    const displayValue = symbol.quantityMode === 'quantity'
-      ? quantity
-      : toLots(quantity);
+    // Always display in lots
+    const displayValue = toLots(quantity);
     el.dataset.qty = quantity.toString();
     el.value = displayValue.toString();
     updateResizeButton();
@@ -732,12 +1019,10 @@ function updateNetPosDisplay(quantity) {
 
 function updateNetPosDisplayMode() {
   const el = document.getElementById('oa-netpos');
-  const symbol = getActiveSymbol();
-  if (el && symbol) {
+  if (el) {
     const baseQty = parseInt(el.dataset.qty || el.value) || 0;
-    const displayValue = symbol.quantityMode === 'quantity'
-      ? baseQty
-      : toLots(baseQty);
+    // Always display in lots
+    const displayValue = toLots(baseQty);
     el.value = displayValue.toString();
     updateResizeButton();
   }
@@ -745,46 +1030,40 @@ function updateNetPosDisplayMode() {
 
 function updateModeIndicator() {
   const el = document.getElementById('oa-mode-indicator');
-  const symbol = getActiveSymbol();
-  if (el && symbol) {
-    el.textContent = symbol.quantityMode === 'quantity' ? 'QTY' : 'LOTS';
-    el.title = 'Click to toggle between QTY and LOTS mode';
-    el.style.background = symbol.quantityMode === 'quantity' ? 'rgba(0, 230, 118, 0.1)' : 'rgba(92, 107, 192, 0.1)';
-    el.style.color = symbol.quantityMode === 'quantity' ? '#00e676' : '#5c6bc0';
+  if (el) {
+    el.textContent = 'LOTS';
+    // Show lot size in tooltip when hovering
+    const lotSizeText = state.lotSize ? `1 LOT = ${state.lotSize} Qty` : 'Loading...';
+    el.title = lotSizeText;
+    el.style.background = 'rgba(92, 107, 192, 0.1)';
+    el.style.color = '#5c6bc0';
+    el.style.cursor = 'default'; // No click needed
   }
-  // Refresh quantity/net position display for the active mode
   syncQuantityInput();
-  updateNetPosDisplayMode();
-  // Re-validate quantity when mode changes
-  validateQuantity();
   updateResizeButton();
 }
 
 function getTargetNetQty() {
   const el = document.getElementById('oa-netpos');
-  const symbol = getActiveSymbol();
-  if (!el || !symbol) return 0;
+  if (!el) return 0;
   // dataset.qty stores base quantity (qty units)
   const datasetQty = parseInt(el.dataset.qty || '0', 10);
   if (datasetQty) return datasetQty;
   const displayValue = parseInt(el.value || '0', 10) || 0;
-  if (symbol.quantityMode === 'quantity') return displayValue;
+  // Always lots mode: display value is lots, convert to qty
   return displayValue * (state.lotSize || 1);
 }
 
 function updateResizeButton() {
   const btn = document.getElementById('oa-resize-btn');
-  const symbol = getActiveSymbol();
-  if (!btn || !symbol) return;
+  if (!btn) return;
 
   const target = getTargetNetQty();
-  const qtyModeIsQty = getQuantityMode() === 'quantity';
-  const displayQty = qtyModeIsQty ? target : toLots(target);
+  const displayQty = toLots(target);
 
   btn.className = 'oa-resize-btn';
   btn.textContent = `Resize ${displayQty}`;
-  const modeText = qtyModeIsQty ? 'qty' : 'lots';
-  btn.title = `Resize position to ${displayQty} ${modeText}`;
+  btn.title = `Resize position to ${displayQty} lots`;
 }
 
 async function placeResize() {
@@ -808,22 +1087,12 @@ async function placeResize() {
 
   const result = await apiCall('/api/v1/placesmartorder', data);
   if (result.status === 'success') {
-    showNotification('Resize placed', 'success');
+    const msg = result.orderid ? `Resize placed! ID: ${result.orderid}` : 'Resize placed';
+    showNotification(msg, 'success');
     fetchOpenPosition();
   } else {
-    showNotification(`Resize failed: ${result.message}`, 'error');
+    showNotification(`Resize failed: ${result.message || 'Unknown error'}`, 'error');
   }
-}
-
-async function toggleQuantityModeUI() {
-  const symbol = getActiveSymbol();
-  if (!symbol) return;
-  symbol.quantityMode = symbol.quantityMode === 'quantity' ? 'lots' : 'quantity';
-  await saveSettings({ symbols: settings.symbols });
-  updateModeIndicator();
-  validateQuantity();
-  fetchOpenPosition();
-  showNotification(`Mode: ${symbol.quantityMode.toUpperCase()}`, 'success');
 }
 
 function initializeQuantityInput() {
@@ -840,117 +1109,33 @@ function initializeQuantityInput() {
     lotsInput.classList.remove('loading');
     syncQuantityInput();
 
-    // Reset auto-corrected flag since this is proper initialization
-    state.quantityAutoCorrected = false;
-
     // Enable buttons
     if (lotsDecBtn) lotsDecBtn.disabled = false;
     if (lotsIncBtn) lotsIncBtn.disabled = false;
     if (lotsUpdateBtn) lotsUpdateBtn.disabled = false;
 
-    // Trigger validation and margin calculation
-    const validationPassed = validateQuantity();
-    if (validationPassed) {
+    // Update mode indicator to show lot size
+    updateModeIndicator();
     fetchMargin();
-    }
     updateResizeButton();
   }
 }
 
+// Simplified validation - always valid in lots mode
 function validateQuantity() {
-  const lotsInput = document.getElementById('oa-lots');
-  const symbol = getActiveSymbol();
-
-  if (!lotsInput || !symbol) return true; // Return true if we can't validate
-  if (!state.lotSize) return true;
-
-  // Don't validate if input is still in loading state
-  if (lotsInput.classList.contains('oa-loading')) return true;
-
-  let validationPassed = true;
-
-  if (symbol.quantityMode === 'quantity') {
-    // In quantity mode, check if the entered quantity is multiple of lot size
-    const quantity = state.lots;
-    if (quantity % state.lotSize !== 0) {
-      // Auto-reset to nearest valid multiple of lot size
-      const remainder = quantity % state.lotSize;
-      const lowerMultiple = quantity - remainder;
-      const upperMultiple = lowerMultiple + state.lotSize;
-
-      // Choose the nearest valid quantity
-      const validQuantity = (remainder <= state.lotSize / 2) ? lowerMultiple : upperMultiple;
-
-      // Ensure we don't go below lot size
-      const finalValidQuantity = Math.max(state.lotSize, validQuantity);
-
-      state.lots = finalValidQuantity;
-      syncQuantityInput();
-      state.quantityAutoCorrected = true;
-      validationPassed = false;
-
-      // Show notification with longer duration
-      showNotification(`Warning invalid qty - Quantity reset to ${finalValidQuantity} (nearest valid multiple).`, 'error', 5000);
-    }
-  }
-  // Keep display in sync for lots mode
-  if (symbol.quantityMode === 'lots') {
-    syncQuantityInput();
-  }
-  // In lots mode, always valid since lots * lotSize is always valid
-  return validationPassed;
+  syncQuantityInput();
+  return true;
 }
 
+// Simplified netpos validation - always valid in lots mode
 function validateNetposQuantity() {
   const netposEl = document.getElementById('oa-netpos');
-  const symbol = getActiveSymbol();
+  if (!netposEl) return true;
 
-  if (!netposEl || !symbol) return true; // Return true if we can't validate
-  if (!state.lotSize) return true;
-
-  // Don't validate if input is still in loading state
-  if (netposEl.classList.contains('oa-loading')) return true;
-
-  if (symbol.quantityMode === 'quantity') {
-    // In quantity mode, check if the entered quantity is multiple of lot size
-    const displayValue = parseInt(netposEl.value || '0', 10) || 0;
-    const quantity = symbol.quantityMode === 'lots' ? displayValue * state.lotSize : displayValue;
-
-    // Use absolute value for validation since position size represents magnitude
-    const absQuantity = Math.abs(quantity);
-
-    if (absQuantity % state.lotSize !== 0) {
-      // Auto-reset to nearest valid multiple of lot size, preserving sign
-      const sign = quantity >= 0 ? 1 : -1;
-      const absRemainder = absQuantity % state.lotSize;
-      const absLowerMultiple = absQuantity - absRemainder;
-      const absUpperMultiple = absLowerMultiple + state.lotSize;
-
-      // Choose the nearest valid absolute quantity
-      const absValidQuantity = (absRemainder <= state.lotSize / 2) ? absLowerMultiple : absUpperMultiple;
-
-      // For negative quantities, allow zero (to close position)
-      const finalValidQuantity = sign * absValidQuantity;
-
-      // Update the input value and dataset
-      const displayQty = symbol.quantityMode === 'lots' ? Math.floor(finalValidQuantity / state.lotSize) : finalValidQuantity;
-      netposEl.value = displayQty.toString();
-      netposEl.dataset.qty = finalValidQuantity.toString();
-
-      // Show notification with longer duration
-      showNotification(`Warning invalid qty - Quantity reset to ${finalValidQuantity} (nearest valid multiple).`, 'error', 5000);
-
-      return false; // Quantity was invalid and auto-corrected
-    }
-  }
-  // Keep display in sync for lots mode
-  if (symbol.quantityMode === 'lots') {
-    const displayValue = parseInt(netposEl.value || '0', 10) || 0;
-    const qty = displayValue * (state.lotSize || 1);
-    netposEl.dataset.qty = qty.toString();
-  }
-
-  return true; // Quantity is valid
+  const displayValue = parseInt(netposEl.value || '0', 10) || 0;
+  const qty = displayValue * (state.lotSize || 1);
+  netposEl.dataset.qty = qty.toString();
+  return true;
 }
 
 function updateExpirySlider() {
@@ -1053,7 +1238,7 @@ function updatePriceDisplay() {
     el.value = state.optionLtp.toFixed(2);
     el.disabled = true;
     updateOrderButton();
-    fetchMargin(); // Fetch margin when price changes
+    // In MARKET mode, don't auto-fetch margin - user clicks refresh button
   } else {
     el.disabled = false;
     updateOrderButton();
@@ -1182,6 +1367,15 @@ function setupScalpingEvents(container) {
     strikeBtn?.classList.add('oa-loading');
 
     await saveSettings({ activeSymbolId: e.target.value });
+
+    // Unsubscribe from old WebSocket subscriptions before changing symbol
+    if (wsSubscriptions.underlying) {
+      wsUnsubscribe(wsSubscriptions.underlying.symbol, wsSubscriptions.underlying.exchange, 'underlying');
+    }
+    if (wsSubscriptions.strike) {
+      wsUnsubscribe(wsSubscriptions.strike.symbol, wsSubscriptions.strike.exchange, 'strike');
+    }
+
     strikeChain = [];
     state.selectedExpiry = '';
     state.selectedSymbol = ''; // Clear symbol to prevent stale margin calls
@@ -1192,16 +1386,15 @@ function setupScalpingEvents(container) {
     if (settings.apiKey && settings.hostUrl) {
       await fetchExpiry(); // Only fetch expiry on symbol change
       startDataRefresh();
+      // Update WebSocket subscriptions for new symbol
+      updateWsSubscriptions();
     }
 
     // Remove loading animation after all data is loaded
     strikeBtn?.classList.remove('oa-loading');
   });
 
-  // Quantity mode toggle (click on mode indicator)
-  container.querySelector('#oa-mode-indicator')?.addEventListener('click', () => {
-    toggleQuantityModeUI();
-  });
+  // Mode indicator - no click handler needed, just shows lot size on hover
 
   // Action toggle (B/S)
   container.querySelector('#oa-action-btn')?.addEventListener('click', (e) => {
@@ -1212,13 +1405,14 @@ function setupScalpingEvents(container) {
     fetchMargin();
   });
 
-  // Option type toggle (CE/PE) - with loading animation and price update
+  // Option type toggle (CE/PE) - optimized: use switchOptionType to avoid API calls
   container.querySelector('#oa-option-type-btn')?.addEventListener('click', async (e) => {
     state.optionType = state.optionType === 'CE' ? 'PE' : 'CE';
     e.target.textContent = state.optionType;
     e.target.dataset.label = e.target.textContent;
     e.target.classList.add('oa-loading');
-    await fetchStrikeChain();
+    // Use optimized switch that doesn't call optionsymbol API
+    await switchOptionType();
     e.target.classList.remove('oa-loading');
     // Update price element with new strike LTP
     if (state.orderType === 'MARKET') {
@@ -1251,7 +1445,7 @@ function setupScalpingEvents(container) {
       state.quantityAutoCorrected = false; // Reset flag on manual change
       const validationPassed = validateQuantity();
       if (validationPassed) {
-      fetchMargin();
+        fetchMargin();
       }
     }
   });
@@ -1266,10 +1460,10 @@ function setupScalpingEvents(container) {
     state.lots += step;
     syncQuantityInput();
     state.quantityAutoCorrected = false; // Reset flag on manual change
-      const validationPassed = validateQuantity();
-      if (validationPassed) {
-    fetchMargin();
-      }
+    const validationPassed = validateQuantity();
+    if (validationPassed) {
+      fetchMargin();
+    }
     updateResizeButton();
   });
   // Qty input - handle click to enable editing (like netpos)
@@ -1328,24 +1522,55 @@ function setupScalpingEvents(container) {
     state.orderType = orderTypes[(idx + 1) % orderTypes.length];
     e.target.textContent = state.orderType;
     updatePriceDisplay();
+    fetchMargin(); // Auto-fetch margin when order type changes
+    updateWsSubscriptions(); // Update WebSocket subscriptions based on new mode
   });
 
-  // Price input - update on blur (click outside) only
+  // Price input - debounced margin calculation while typing (1 sec)
   const priceInput = container.querySelector('#oa-price');
+  let priceDebounceTimer = null;
+  priceInput?.addEventListener('input', (e) => {
+    if (state.orderType === 'MARKET') return; // MARKET mode doesn't allow editing
+    state.price = parseFloat(e.target.value) || 0;
+    updateOrderButton();
+    // Debounce margin calculation by 1 second
+    clearTimeout(priceDebounceTimer);
+    priceDebounceTimer = setTimeout(() => {
+      fetchMargin();
+    }, 1000);
+  });
   priceInput?.addEventListener('blur', (e) => {
+    if (state.orderType === 'MARKET') return;
+    clearTimeout(priceDebounceTimer);
     state.price = parseFloat(e.target.value) || 0;
     updateOrderButton();
     fetchMargin();
   });
 
-  // Price update button (↻)
-  container.querySelector('#oa-price-update')?.addEventListener('click', () => {
+  // Price update button (↻) - Fetch latest price via API and calculate margin
+  const priceUpdateBtn = container.querySelector('#oa-price-update');
+  if (priceUpdateBtn) priceUpdateBtn.title = 'Refresh price';
+  priceUpdateBtn?.addEventListener('click', async () => {
     const priceEl = document.getElementById('oa-price');
-    if (priceEl) {
-      state.price = parseFloat(priceEl.value) || 0;
-      updateOrderButton();
-      fetchMargin();
+    if (!priceEl) return;
+
+    // Call quotes API to get latest price
+    const selected = strikeChain.find(s => s.offset === state.selectedOffset);
+    if (selected) {
+      const result = await apiCall('/api/v1/quotes', { symbol: selected.symbol, exchange: selected.exchange });
+      if (result.status === 'success' && result.data) {
+        state.optionLtp = result.data.ltp || state.optionLtp;
+        state.optionPrevClose = result.data.prev_close || state.optionPrevClose;
+        selected.ltp = state.optionLtp;
+        selected.prevClose = state.optionPrevClose;
+      }
     }
+
+    // Update display price and calculate margin
+    priceEl.value = state.optionLtp.toFixed(2);
+    state.price = state.optionLtp;
+    updateOrderButton();
+    fetchMargin();
   });
 
   // Lots update button (↻)
@@ -1369,7 +1594,7 @@ function setupScalpingEvents(container) {
       }
 
       if (validationPassed) {
-      fetchMargin();
+        fetchMargin();
       }
       updateResizeButton();
     }
@@ -1413,6 +1638,20 @@ function setupScalpingEvents(container) {
     if (e.target.value === 'Loading...' || e.target.readOnly) return;
     validateNetposQuantity();
     updateResizeButton();
+  });
+
+  // Net pos input - auto-update resize button while typing (100ms debounce)
+  let netposDebounceTimer = null;
+  container.querySelector('#oa-netpos')?.addEventListener('input', (e) => {
+    if (e.target.readOnly) return;
+    clearTimeout(netposDebounceTimer);
+    netposDebounceTimer = setTimeout(() => {
+      // Update dataset.qty for resize button calculation
+      const displayValue = parseInt(e.target.value) || 0;
+      const qty = displayValue * (state.lotSize || 1);
+      e.target.dataset.qty = qty.toString();
+      updateResizeButton();
+    }, 100);
   });
 
   // Net pos refresh button (↻)
@@ -1466,8 +1705,8 @@ function setupScalpingEvents(container) {
 
     // Only place order if validation passed
     if (validationPassed) {
-    if (state.useMoneyness) placeOptionsOrder();
-    else placePlaceOrder();
+      if (state.useMoneyness) placeOptionsOrder();
+      else placePlaceOrder();
     }
   });
 
@@ -1534,18 +1773,23 @@ function toggleRefreshPanel() {
 function buildRefreshPanel() {
   return `
     <div class="oa-refresh-content">
-      <div class="oa-refresh-row">
-        <div class="oa-refresh-col">
-          <label class="oa-small-label">Mode</label>
-          <select id="oa-refresh-mode" class="oa-small-select">
-            <option value="manual" ${state.refreshMode === 'manual' ? 'selected' : ''}>Manual</option>
-            <option value="auto" ${state.refreshMode === 'auto' ? 'selected' : ''}>Auto</option>
-          </select>
+      <div class="oa-refresh-row" style="justify-content:space-between;">
+        <div style="display:flex;gap:8px;">
+          <div class="oa-refresh-col">
+            <label class="oa-small-label">Mode</label>
+            <select id="oa-refresh-mode" class="oa-small-select">
+              <option value="manual" ${state.refreshMode === 'manual' ? 'selected' : ''}>Manual</option>
+              <option value="auto" ${state.refreshMode === 'auto' ? 'selected' : ''}>Auto</option>
+            </select>
+          </div>
+          <div class="oa-refresh-col" id="oa-interval-group" ${state.refreshMode === 'manual' ? 'style="display:none"' : ''}>
+            <label class="oa-small-label">Sec</label>
+            <input id="oa-refresh-interval" type="number" min="3" max="60" value="${state.refreshIntervalSec}" class="oa-small-input">
+          </div>
         </div>
-        <div class="oa-refresh-col" id="oa-interval-group" ${state.refreshMode === 'manual' ? 'style="display:none"' : ''}>
-          <label class="oa-small-label">Sec</label>
-          <input id="oa-refresh-interval" type="number" min="3" max="60" value="${state.refreshIntervalSec}" class="oa-small-input">
-        </div>
+        <label class="oa-checkbox-compact" style="align-self:flex-end;margin-bottom:2px;" title="Enable WebSocket live data streaming">
+          <input type="checkbox" id="oa-live-data" ${state.liveDataEnabled ? 'checked' : ''}> Live
+        </label>
       </div>
       <div class="oa-checkbox-inline">
         <label class="oa-checkbox-compact"><input type="checkbox" id="oa-ref-funds" ${state.refreshAreas.funds ? 'checked' : ''}> Funds</label>
@@ -1565,6 +1809,13 @@ function setupRefreshEvents(panel) {
     const intGroup = panel.querySelector('#oa-interval-group');
     if (intGroup) intGroup.style.display = e.target.value === 'manual' ? 'none' : '';
   });
+
+  // Live data checkbox - toggle immediately
+  panel.querySelector('#oa-live-data')?.addEventListener('change', (e) => {
+    toggleLiveData(e.target.checked);
+    showNotification(e.target.checked ? 'Live data enabled' : 'Live data disabled', 'success');
+  });
+
   panel.querySelector('#oa-refresh-save')?.addEventListener('click', async () => {
     state.refreshMode = panel.querySelector('#oa-refresh-mode').value;
     state.refreshIntervalSec = parseInt(panel.querySelector('#oa-refresh-interval').value) || 5;
@@ -1656,69 +1907,72 @@ async function extendStrikes() {
 
   try {
     const symbol = getActiveSymbol();
-    if (!symbol || !state.selectedExpiry) return;
+    if (!symbol || !state.selectedExpiry || !strikeInterval || !cachedATMStrike) return;
 
-  const btn = document.getElementById('oa-extend-strikes');
-  if (btn) btn.classList.add('oa-loading');
+    const btn = document.getElementById('oa-extend-strikes');
+    if (btn) btn.classList.add('oa-loading');
 
-  state.extendLevel++;
-  const newITM = `ITM${state.extendLevel}`;
-  const newOTM = `OTM${state.extendLevel}`;
+    state.extendLevel++;
+    const newITMLevel = state.extendLevel;
+    const newOTMLevel = state.extendLevel;
 
-  // Fetch new ITM and OTM strikes sequentially to respect rate limits
-  const results = [];
-  for (const offset of [newITM, newOTM]) {
-    const result = await rateLimitedApiCall('/api/v1/optionsymbol', {
-      strategy: 'Chrome',
-      underlying: symbol.symbol,
-      exchange: symbol.exchange,
-      expiry_date: state.selectedExpiry,
-      offset: offset,
-      option_type: state.optionType
+    // Calculate direction based on option type
+    // For CE: ITM is below ATM (lower strike), OTM is above ATM (higher strike)
+    // For PE: ITM is above ATM (higher strike), OTM is below ATM (lower strike)
+    const isPE = state.optionType === 'PE';
+    const itmDirection = isPE ? 1 : -1;
+    const otmDirection = isPE ? -1 : 1;
+
+    // Dynamically calculate new strikes using strikeInterval
+    const newStrikes = [];
+
+    // New ITM strike
+    const itmStrikeValue = cachedATMStrike + (newITMLevel * strikeInterval * itmDirection);
+    newStrikes.push({
+      offset: `ITM${newITMLevel}`,
+      symbol: `${symbol.symbol}${state.selectedExpiry}${itmStrikeValue}${state.optionType}`,
+      exchange: symbol.optionExchange,
+      strike: itmStrikeValue,
+      lotsize: state.lotSize,
+      ltp: 0,
+      prevClose: 0
     });
-    results.push(result);
-  }
-  const newStrikes = [];
 
-  results.forEach((r, i) => {
-    if (r.status === 'success') {
-      const offset = i === 0 ? newITM : newOTM;
-      const strikeMatch = r.symbol.match(/^[A-Z]+(?:\d{2}[A-Z]{3}\d{2})(\d+)(?=CE$|PE$)/);
-      newStrikes.push({
-        offset,
-        symbol: r.symbol,
-        exchange: r.exchange || symbol.optionExchange,
-        strike: strikeMatch ? parseInt(strikeMatch[1]) : 0,
-        lotsize: r.lotsize || state.lotSize,
-        ltp: 0,
-        prevClose: 0
-      });
+    // New OTM strike
+    const otmStrikeValue = cachedATMStrike + (newOTMLevel * strikeInterval * otmDirection);
+    newStrikes.push({
+      offset: `OTM${newOTMLevel}`,
+      symbol: `${symbol.symbol}${state.selectedExpiry}${otmStrikeValue}${state.optionType}`,
+      exchange: symbol.optionExchange,
+      strike: otmStrikeValue,
+      lotsize: state.lotSize,
+      ltp: 0,
+      prevClose: 0
+    });
+
+    // Add to chain (ITM at beginning, OTM at end)
+    const itmStrike = newStrikes.find(s => s.offset === `ITM${newITMLevel}`);
+    const otmStrike = newStrikes.find(s => s.offset === `OTM${newOTMLevel}`);
+    if (itmStrike) strikeChain.unshift(itmStrike);
+    if (otmStrike) strikeChain.push(otmStrike);
+
+    // Fetch LTPs for new strikes via multiquotes
+    if (newStrikes.length > 0) {
+      const symbols = newStrikes.map(s => ({ symbol: s.symbol, exchange: s.exchange }));
+      const result = await apiCall('/api/v1/multiquotes', { symbols });
+      if (result.status === 'success' && result.results) {
+        result.results.forEach(r => {
+          const strike = strikeChain.find(s => s.symbol === r.symbol);
+          if (strike && r.data) {
+            strike.ltp = r.data.ltp || 0;
+            strike.prevClose = r.data.prev_close || 0;
+          }
+        });
+      }
     }
-  });
 
-  // Add to chain (ITM at beginning, OTM at end)
-  const itmStrike = newStrikes.find(s => s.offset === newITM);
-  const otmStrike = newStrikes.find(s => s.offset === newOTM);
-  if (itmStrike) strikeChain.unshift(itmStrike);
-  if (otmStrike) strikeChain.push(otmStrike);
-
-  // Fetch LTPs for new strikes
-  if (newStrikes.length > 0) {
-    const symbols = newStrikes.map(s => ({ symbol: s.symbol, exchange: s.exchange }));
-    const result = await apiCall('/api/v1/multiquotes', { symbols });
-    if (result.status === 'success' && result.results) {
-      result.results.forEach(r => {
-        const strike = strikeChain.find(s => s.symbol === r.symbol);
-        if (strike && r.data) {
-          strike.ltp = r.data.ltp || 0;
-          strike.prevClose = r.data.prev_close || 0;
-        }
-      });
-    }
-  }
-
-  updateStrikeDropdown();
-  if (btn) btn.classList.remove('oa-loading');
+    updateStrikeDropdown();
+    if (btn) btn.classList.remove('oa-loading');
   } finally {
     isExtendingStrikes = false;
   }
@@ -1760,8 +2014,8 @@ function buildSettingsPanel() {
         <input id="oa-apikey" type="text" value="${settings.apiKey}">
       </div>
       <div class="oa-form-group">
-        <label>Rate Limit (ms delay between API calls)</label>
-        <input id="oa-ratelimit" type="number" min="0" max="1000" value="${state.rateLimit}">
+        <label>WebSocket URL</label>
+        <input id="oa-wsurl" type="text" value="${state.wsUrl}" placeholder="ws://127.0.0.1:8765">
       </div>
       <div class="oa-form-group">
         <label>UI Mode</label>
@@ -1941,13 +2195,15 @@ function setupSettingsEvents(panel) {
 
   // Save settings
   panel.querySelector('#oa-save-settings')?.addEventListener('click', async () => {
+    const newWsUrl = panel.querySelector('#oa-wsurl')?.value || 'ws://127.0.0.1:8765';
+    state.wsUrl = newWsUrl;
+
     const newSettings = {
       hostUrl: panel.querySelector('#oa-host').value,
       apiKey: panel.querySelector('#oa-apikey').value,
       uiMode: panel.querySelector('#oa-uimode').value,
-      rateLimit: parseInt(panel.querySelector('#oa-ratelimit').value) || 100
+      wsUrl: newWsUrl
     };
-    state.rateLimit = newSettings.rateLimit;
 
     if (newSettings.uiMode === 'quick') {
       newSettings.symbol = panel.querySelector('#oa-quick-symbol')?.value || '';
