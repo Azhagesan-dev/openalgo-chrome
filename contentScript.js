@@ -305,6 +305,11 @@ function wsSubscribe(symbol, exchange, type) {
 
   const key = type === 'underlying' ? 'underlying' : 'strike';
 
+  // If already subscribed to the same symbol, do nothing
+  if (wsSubscriptions[key] && wsSubscriptions[key].symbol === symbol) {
+    return;
+  }
+
   // Unsubscribe from previous if different
   if (wsSubscriptions[key] && wsSubscriptions[key].symbol !== symbol) {
     wsUnsubscribe(wsSubscriptions[key].symbol, wsSubscriptions[key].exchange, type);
@@ -525,15 +530,14 @@ async function _fetchOpenPosition() {
     const quantity = parseInt(result.quantity) || 0;
     updateNetPosDisplay(quantity);
 
-    // Reset netpos input editing state and update resize button to show 0
+    // Reset netpos input editing state on successful API fetch
     const netposEl = document.getElementById('oa-netpos');
     if (netposEl) {
       netposEl.dataset.editing = 'false';
       netposEl.dataset.qty = quantity.toString();
       netposEl.value = toLots(quantity).toString(); // Sync display value
+      updateResizeButton(); // Update button to "Resize 0"
     }
-    // Reset resize button to show 0 change (target = current)
-    updateResizeButton();
   }
 }
 
@@ -777,7 +781,11 @@ function updateSelectedOptionLTP() {
     state.selectedStrike = selected.strike;
     // Prepare symbol for margin call which happens in updatePriceDisplay
     state.selectedSymbol = selected.symbol;
-    updatePriceDisplay();
+
+    // Sync price for Limit orders on selection change
+    state.price = state.optionLtp;
+
+    updatePriceDisplay(true);
     updateStrikeButton();
     fetchMargin(); // Auto-fetch margin when strike changes
     updateWsSubscriptions(); // Update WebSocket subscriptions for new strike
@@ -944,7 +952,16 @@ async function refreshSelectedStrike() {
 
     if (symbolResult.status === 'success') {
       const strikeMatch = symbolResult.symbol.match(/^[A-Z]+(?:\d{2}[A-Z]{3}\d{2})(\d+)(?=CE$|PE$)/);
-      state.selectedStrike = strikeMatch ? parseInt(strikeMatch[1]) : 0;
+      const newStrike = strikeMatch ? parseInt(strikeMatch[1]) : 0;
+
+      // If strike changed for the selected offset (e.g. ATM shifted), or lot size changed
+      if ((newStrike !== state.selectedStrike && state.selectedStrike !== 0) || (symbolResult.lotsize && symbolResult.lotsize !== state.lotSize)) {
+        // Rebuild the whole chain to ensure consistency and avoid duplicates
+        fetchStrikeChain();
+        return;
+      }
+
+      state.selectedStrike = newStrike;
       state.selectedSymbol = symbolResult.symbol;
       state.lotSize = symbolResult.lotsize || state.lotSize;
 
@@ -1020,6 +1037,9 @@ function updateNetPosDisplay(quantity) {
 function updateNetPosDisplayMode() {
   const el = document.getElementById('oa-netpos');
   if (el) {
+    // Only update if not editing (though API fetch usually resets editing state)
+    if (el.dataset.editing === 'true') return;
+
     const baseQty = parseInt(el.dataset.qty || el.value) || 0;
     // Always display in lots
     const displayValue = toLots(baseQty);
@@ -1056,21 +1076,35 @@ function getTargetNetQty() {
 
 function updateResizeButton() {
   const btn = document.getElementById('oa-resize-btn');
-  if (!btn) return;
+  const netposEl = document.getElementById('oa-netpos');
+  if (!btn || !netposEl) return;
 
-  const target = getTargetNetQty();
-  const displayQty = toLots(target);
+  const isEditing = netposEl.dataset.editing === 'true';
 
-  btn.className = 'oa-resize-btn';
-  btn.textContent = `Resize ${displayQty}`;
-  btn.title = `Resize position to ${displayQty} lots`;
+  if (!isEditing) {
+    // Default state: Resize 0 (Close position)
+    btn.className = 'oa-resize-btn neutral';
+    btn.textContent = 'Resize 0';
+    btn.title = 'Close position';
+  } else {
+    // Editing state: Resize to target
+    const target = getTargetNetQty();
+    const displayQty = toLots(target);
+    btn.className = 'oa-resize-btn';
+    btn.textContent = `Resize ${displayQty}`;
+    btn.title = `Resize position to ${displayQty} lots`;
+  }
 }
 
 async function placeResize() {
   const symbol = getActiveSymbol();
   if (!symbol || !state.selectedSymbol) return showNotification('No symbol selected', 'error');
 
-  const targetQty = getTargetNetQty(); // qty units for API - can be negative
+  const netposEl = document.getElementById('oa-netpos');
+  const isEditing = netposEl && netposEl.dataset.editing === 'true';
+
+  // If not editing, target is ALWAYS 0 (Close Position)
+  const targetQty = isEditing ? getTargetNetQty() : 0;
 
   const data = {
     strategy: 'Chrome',
@@ -1079,15 +1113,18 @@ async function placeResize() {
     action: state.action,
     product: symbol.productType,
     pricetype: 'MARKET',
-    quantity: '0', // Always use 0 for quantity
-    position_size: String(targetQty), // Use target position (can be negative)
+    quantity: String(Math.abs(targetQty)), // Quantity must be positive
+    position_size: String(targetQty), // Use target position
     price: '0',
     trigger_price: '0'
   };
 
   const result = await apiCall('/api/v1/placesmartorder', data);
   if (result.status === 'success') {
-    const msg = result.orderid ? `Resize placed! ID: ${result.orderid}` : 'Resize placed';
+    // Show orderid if present, otherwise show message field
+    const msg = result.orderid
+      ? `Resize placed! ID: ${result.orderid}`
+      : (result.message || 'Resize placed');
     showNotification(msg, 'success');
     fetchOpenPosition();
   } else {
@@ -1116,7 +1153,7 @@ function initializeQuantityInput() {
 
     // Update mode indicator to show lot size
     updateModeIndicator();
-    fetchMargin();
+    // Margin fetch removed to avoid duplicate calls during chain load
     updateResizeButton();
   }
 }
@@ -1170,13 +1207,17 @@ function updateExpirySlider() {
       strikeCol?.classList.remove('oa-loading');
       ltpCol?.classList.add('oa-loading');
 
-      await fetchStrikeLTPs();
+      // fetchStrikeChain already calls _fetchStrikeLTPs, so no need to call it again here
+      // This prevents the "multiquotes called twice" issue
 
       // Remove all loading
       strikeBtn?.classList.remove('oa-loading');
       priceInput?.classList.remove('oa-loading');
       orderBtn?.classList.remove('oa-loading');
       ltpCol?.classList.remove('oa-loading');
+
+      // Update open position for the new expiry context
+      fetchOpenPosition();
     });
   });
 }
@@ -1231,11 +1272,15 @@ function updateStrikeButton() {
   }
 }
 
-function updatePriceDisplay() {
+function updatePriceDisplay(forceUpdate = false) {
   const el = document.getElementById('oa-price');
   if (!el) return;
-  if (state.orderType === 'MARKET') {
+
+  if (state.orderType === 'MARKET' || forceUpdate) {
     el.value = state.optionLtp.toFixed(2);
+  }
+
+  if (state.orderType === 'MARKET') {
     el.disabled = true;
     updateOrderButton();
     // In MARKET mode, don't auto-fetch margin - user clicks refresh button
@@ -1249,11 +1294,14 @@ function updateOrderButton() {
   const btn = document.getElementById('oa-order-btn');
   if (!btn) return;
   const marginText = state.margin > 0 ? ` [₹${formatNumber(state.margin, 0)}]` : '';
+  const displayQty = getDisplayQuantity();
+  const qtyText = `${displayQty} lot`;
+
   if (state.orderType === 'MARKET') {
-    btn.textContent = `${state.action} @ MARKET${marginText}`;
+    btn.textContent = `${qtyText} @ MARKET${marginText}`;
   } else {
     const price = state.price;
-    btn.textContent = `${state.action} @ ${formatNumber(price)}${marginText}`;
+    btn.textContent = `${qtyText} @ ${formatNumber(price)}${marginText}`;
   }
   btn.className = `oa-order-btn ${state.action === 'BUY' ? 'buy' : 'sell'}`;
 }
@@ -1261,6 +1309,14 @@ function updateOrderButton() {
 function toggleStrikeDropdown(show) {
   const dd = document.getElementById('oa-strike-dropdown');
   if (dd) dd.classList.toggle('hidden', !show);
+
+  // Update hover text based on current mode
+  const updateBtn = document.getElementById('oa-update-strikes');
+  if (updateBtn) {
+    updateBtn.title = state.strikeMode === 'moneyness'
+      ? 'Update Strikes and LTP'
+      : 'Update LTP';
+  }
 }
 
 // Inject the main UI
@@ -1307,10 +1363,7 @@ function buildScalpingUI() {
       <button id="oa-strike-btn" class="oa-strike-select">${strikeText}</button>
       <div class="oa-lots">
         <button id="oa-lots-dec" class="oa-lot-btn" disabled>−</button>
-        <div class="oa-input-wrapper">
-          <input id="oa-lots" type="text" value="0" readonly>
-          <button id="oa-lots-update" class="oa-input-update" title="Set" disabled>↻</button>
-        </div>
+        <input id="oa-lots" type="text" value="0" readonly>
         <button id="oa-lots-inc" class="oa-lot-btn" disabled>+</button>
       </div>
       <button id="oa-ordertype-btn" class="oa-toggle oa-ordertype-fixed">${state.orderType}</button>
@@ -1322,7 +1375,7 @@ function buildScalpingUI() {
       <div class="oa-netpos-input-wrapper">
         <span class="oa-netpos-label" title="Net Position">P</span>
         <input id="oa-netpos" type="text" class="oa-netpos-input" value="0" readonly>
-        <button id="oa-netpos-update" class="oa-input-update" title="Refresh Net Position">↻</button>
+        <button id="oa-netpos-update" class="oa-input-update" title="Refresh position">↻</button>
       </div>
       <button id="oa-resize-btn" class="oa-resize-btn neutral" title="Resize position">Resize</button>
     </div>
@@ -1414,10 +1467,10 @@ function setupScalpingEvents(container) {
     // Use optimized switch that doesn't call optionsymbol API
     await switchOptionType();
     e.target.classList.remove('oa-loading');
-    // Update price element with new strike LTP
-    if (state.orderType === 'MARKET') {
-      updatePriceDisplay();
-    }
+    // Update price element with new strike LTP (for all order types)
+    updatePriceDisplay();
+    // Fetch openposition for the new option symbol
+    fetchOpenPosition();
   });
 
   // Strike button
@@ -1475,11 +1528,36 @@ function setupScalpingEvents(container) {
     }
   });
 
+  // Qty input - debounced margin calculation while typing (1 sec)
+  let lotsDebounceTimer = null;
+  container.querySelector('#oa-lots')?.addEventListener('input', (e) => {
+    if (e.target.readOnly) return;
+    const symbol = getActiveSymbol();
+    const minDisplay = symbol ? (symbol.quantityMode === 'lots' ? 1 : (state.lotSize || 1)) : 1;
+    const parsedValue = parseInt(e.target.value) || minDisplay;
+    setQuantityFromDisplay(parsedValue);
+    updateResizeButton();
+
+    // Fast UI update (100ms)
+    clearTimeout(state.lotsUiDebounceTimer);
+    state.lotsUiDebounceTimer = setTimeout(() => {
+      updateOrderButton();
+    }, 100);
+
+    // Debounce margin calculation by 1 second
+    clearTimeout(lotsDebounceTimer);
+    lotsDebounceTimer = setTimeout(() => {
+      fetchMargin();
+    }, 1000);
+  });
+
   // Qty input - handle blur (click outside)
   container.querySelector('#oa-lots')?.addEventListener('blur', (e) => {
     if (!e.target.readOnly) {
+      clearTimeout(lotsDebounceTimer);
       e.target.readOnly = true;
       e.target.classList.remove('editable');
+      fetchMargin(); // Fetch margin immediately on blur
     }
   });
 
@@ -1570,35 +1648,17 @@ function setupScalpingEvents(container) {
     priceEl.value = state.optionLtp.toFixed(2);
     state.price = state.optionLtp;
     updateOrderButton();
+
+    // Clear any pending debounce timer to prevent double call
+    if (priceDebounceTimer) {
+      clearTimeout(priceDebounceTimer);
+      priceDebounceTimer = null;
+    }
+
     fetchMargin();
   });
 
-  // Lots update button (↻)
-  container.querySelector('#oa-lots-update')?.addEventListener('click', () => {
-    const lotsEl = document.getElementById('oa-lots');
-    const symbol = getActiveSymbol();
 
-    // Don't process if controls are disabled or in loading state
-    if (!lotsEl || lotsEl.value === 'Loading...') return;
-
-    if (symbol) {
-      const minValue = symbol.quantityMode === 'lots' ? 1 : (state.lotSize || 1);
-      const newValue = Math.max(minValue, parseInt(lotsEl.value) || minValue);
-      setQuantityFromDisplay(newValue);
-      state.quantityAutoCorrected = false; // Reset flag on manual change
-
-      // Only validate in quantity mode
-      let validationPassed = true;
-      if (symbol.quantityMode === 'quantity') {
-        validationPassed = validateQuantity();
-      }
-
-      if (validationPassed) {
-        fetchMargin();
-      }
-      updateResizeButton();
-    }
-  });
 
   // Net pos refresh functionality - double click on input to refresh
   container.querySelector('#oa-netpos')?.addEventListener('dblclick', () => {
@@ -1614,9 +1674,6 @@ function setupScalpingEvents(container) {
       e.target.classList.add('editable');
       e.target.select();
       e.target.dataset.editing = 'true';
-      // Update button title for editing mode
-      const updateBtn = document.getElementById('oa-netpos-update');
-      if (updateBtn) updateBtn.title = 'Set target qty';
     }
   });
 
@@ -1654,32 +1711,22 @@ function setupScalpingEvents(container) {
     }, 100);
   });
 
-  // Net pos refresh button (↻)
+  // Net pos refresh button (↻) - always fetch openposition when clicked
   container.querySelector('#oa-netpos-update')?.addEventListener('click', () => {
     const netposEl = document.getElementById('oa-netpos');
     const updateBtn = document.getElementById('oa-netpos-update');
-    const symbol = getActiveSymbol();
-    if (netposEl && (netposEl.dataset.editing === 'true' || !netposEl.readOnly)) {
-      // If user modified the quantity, commit the edited value
-      const newDisplayValue = parseInt(netposEl.value) || 0; // Allow negative values
-      const baseQty = symbol
-        ? (symbol.quantityMode === 'lots' ? newDisplayValue * (state.lotSize || 1) : newDisplayValue)
-        : newDisplayValue;
-      netposEl.dataset.qty = baseQty.toString();
-      netposEl.value = (symbol && symbol.quantityMode === 'lots' ? newDisplayValue : baseQty).toString();
-      // Make it readonly again after setting the value
+
+    // If in edit mode, exit edit mode first
+    if (netposEl && !netposEl.readOnly) {
       netposEl.readOnly = true;
       netposEl.classList.remove('editable');
       netposEl.dataset.editing = 'false';
-      // Reset auto-corrected flag since user has confirmed the value
-      state.netposAutoCorrected = false;
-      // Reset button title back to refresh mode
-      if (updateBtn) updateBtn.title = 'Refresh Net Position';
-      updateResizeButton();
-    } else {
-      // If readonly, fetch current position
-      fetchOpenPosition();
+      // Keep title as 'Refresh position'
+      if (updateBtn) updateBtn.title = 'Refresh position';
     }
+
+    // Always fetch current position from API
+    fetchOpenPosition();
   });
 
   // Resize button
@@ -1771,6 +1818,8 @@ function toggleRefreshPanel() {
 }
 
 function buildRefreshPanel() {
+  const liveClass = state.liveDataEnabled ? 'oa-btn success' : 'oa-btn';
+  const liveText = state.liveDataEnabled ? '● Live' : '○ Live';
   return `
     <div class="oa-refresh-content">
       <div class="oa-refresh-row" style="justify-content:space-between;">
@@ -1787,9 +1836,9 @@ function buildRefreshPanel() {
             <input id="oa-refresh-interval" type="number" min="3" max="60" value="${state.refreshIntervalSec}" class="oa-small-input">
           </div>
         </div>
-        <label class="oa-checkbox-compact" style="align-self:flex-end;margin-bottom:2px;" title="Enable WebSocket live data streaming">
-          <input type="checkbox" id="oa-live-data" ${state.liveDataEnabled ? 'checked' : ''}> Live
-        </label>
+        <button id="oa-live-data-btn" class="${liveClass}" style="align-self:flex-end;font-size:0.75rem;padding:0.25rem 0.5rem;height:auto;" title="Toggle WebSocket live data streaming">
+          ${liveText}
+        </button>
       </div>
       <div class="oa-checkbox-inline">
         <label class="oa-checkbox-compact"><input type="checkbox" id="oa-ref-funds" ${state.refreshAreas.funds ? 'checked' : ''}> Funds</label>
@@ -1810,10 +1859,14 @@ function setupRefreshEvents(panel) {
     if (intGroup) intGroup.style.display = e.target.value === 'manual' ? 'none' : '';
   });
 
-  // Live data checkbox - toggle immediately
-  panel.querySelector('#oa-live-data')?.addEventListener('change', (e) => {
-    toggleLiveData(e.target.checked);
-    showNotification(e.target.checked ? 'Live data enabled' : 'Live data disabled', 'success');
+  // Live data button - toggle immediately and rebuild panel to show updated state
+  panel.querySelector('#oa-live-data-btn')?.addEventListener('click', () => {
+    const newState = !state.liveDataEnabled;
+    toggleLiveData(newState);
+    showNotification(newState ? 'Live data enabled' : 'Live data disabled', 'success');
+    // Rebuild panel to update button appearance
+    panel.innerHTML = buildRefreshPanel();
+    setupRefreshEvents(panel);
   });
 
   panel.querySelector('#oa-refresh-save')?.addEventListener('click', async () => {
@@ -1861,19 +1914,19 @@ async function updateStrikesAndQuotes() {
   if (state.strikeMode === 'moneyness') {
     // Show loading on strike column first for moneyness mode
     strikeCol?.classList.add('oa-loading');
-
-    // Re-fetch moneyness-based strikes using optionsymbol API
-    await fetchStrikeChain();
-
-    // Now loading on LTP column while quotes fetch
-    strikeCol?.classList.remove('oa-loading');
     ltpCol?.classList.add('oa-loading');
 
-    await fetchStrikeLTPs();
+    // Re-fetch moneyness-based strikes using optionsymbol API
+    // This also fetches LTPs, so no need to call fetchStrikeLTPs separately
+    await fetchStrikeChain();
+
+    strikeCol?.classList.remove('oa-loading');
+    ltpCol?.classList.remove('oa-loading');
   } else {
     // In strike mode, only show loading on LTP column (only quotes update)
     ltpCol?.classList.add('oa-loading');
-    await fetchStrikeLTPs();
+    await _fetchStrikeLTPs(); // Ensure using internal function name if alias doesn't work
+    ltpCol?.classList.remove('oa-loading');
   }
 
   // Update price if MARKET order
@@ -1883,7 +1936,6 @@ async function updateStrikesAndQuotes() {
 
   // Remove all loading
   btn?.classList.remove('oa-loading');
-  ltpCol?.classList.remove('oa-loading');
 }
 
 async function toggleStrikeMode() {
@@ -1894,6 +1946,14 @@ async function toggleStrikeMode() {
   // Update mode button label
   const btn = document.getElementById('oa-mode-toggle');
   if (btn) btn.textContent = state.strikeMode === 'moneyness' ? 'M' : 'S';
+
+  // Update hover text for update button
+  const updateBtn = document.getElementById('oa-update-strikes');
+  if (updateBtn) {
+    updateBtn.title = state.strikeMode === 'moneyness'
+      ? 'Update Strikes and LTP'
+      : 'Update LTP';
+  }
 
   // Update strike dropdown to show editable/non-editable strike
   updateStrikeDropdown();
@@ -2326,7 +2386,10 @@ function injectStyles() {
     .oa-lot-btn { background: #222 !important; color: #fff !important; border: none !important; border-radius: 3px !important; width: 22px !important; height: 22px !important; cursor: pointer !important; font-size: 14px !important; padding: 0 !important; margin: 0 !important; }
     .oa-lot-btn:disabled { background: #333 !important; color: #666 !important; cursor: not-allowed !important; }
     .oa-light-theme .oa-lot-btn:disabled { background: #ccc !important; color: #999 !important; }
-    .oa-lots input { width: 80px !important; background: #111 !important; color: #fff !important; border: 1px solid #333 !important; border-radius: 4px !important; text-align: right !important; padding: 5px 18px 5px 5px !important; font-size: 10px !important; height: 24px !important; box-sizing: border-box !important; }
+    .oa-lot-btn:disabled { background: #333 !important; color: #666 !important; cursor: not-allowed !important; }
+    .oa-light-theme .oa-lot-btn:disabled { background: #ccc !important; color: #999 !important; }
+    .oa-lots input { width: 80px !important; background: #111 !important; color: #fff !important; border: 1px solid #333 !important; border-radius: 4px !important; text-align: center !important; padding: 5px 5px !important; font-size: 10px !important; height: 24px !important; box-sizing: border-box !important; }
+    .oa-lots input:disabled { background: #222 !important; color: #666 !important; cursor: not-allowed !important; }
     .oa-lots input:disabled { background: #222 !important; color: #666 !important; cursor: not-allowed !important; }
     .oa-lots input.editable { border-color: #5c6bc0 !important; background: #1a1a2e !important; }
     .oa-lots input[readonly] { cursor: pointer !important; }
@@ -2339,7 +2402,7 @@ function injectStyles() {
     .oa-input-update { position: absolute !important; right: 2px !important; top: 50% !important; transform: translateY(-50%) !important; background: transparent !important; border: none !important; color: #666 !important; font-size: 10px !important; cursor: pointer !important; padding: 2px !important; line-height: 1 !important; }
     .oa-input-update:hover:not(:disabled) { color: #00e676; }
     .oa-input-update:disabled { color: #666; cursor: not-allowed; }
-    .oa-lots .oa-input-wrapper input { width: 70px !important; background: #111 !important; color: #fff !important; border: 1px solid #333 !important; border-radius: 4px !important; text-align: right !important; padding: 5px 18px 5px 5px !important; font-size: 10px !important; height: 24px !important; box-sizing: border-box !important; }
+    .oa-lots .oa-input-wrapper input { width: 70px !important; background: #111 !important; color: #fff !important; border: 1px solid #333 !important; border-radius: 4px !important; text-align: center !important; padding: 5px 18px 5px 5px !important; font-size: 10px !important; height: 24px !important; box-sizing: border-box !important; }
     .oa-lots input.loading { text-align: center; }
     .oa-light-theme .oa-lots .oa-input-wrapper input { background: #f0f0f0 !important; color: #222 !important; border-color: #ccc !important; }
     .oa-light-theme .oa-lots input.editable { border-color: #3b82f6 !important; background: #fff !important; }
@@ -2351,8 +2414,9 @@ function injectStyles() {
     /* Net pos button and input */
     .oa-netpos-btn { background: #222 !important; color: #ccc !important; border: 1px solid #333 !important; border-radius: 4px !important; padding: 4px 6px !important; cursor: pointer !important; font-size: 11px !important; font-weight: 700 !important; white-space: nowrap !important; height: auto !important; width: auto !important; }
     .oa-netpos-btn:hover { background: #333 !important; color: #fff !important; }
+    .oa-netpos-btn:hover { background: #333 !important; color: #fff !important; }
     .oa-netpos-input-wrapper { position: relative !important; display: inline-flex !important; align-items: center !important; margin-left: 2px !important; }
-    .oa-netpos-input { width: 70px !important; background: #111 !important; color: #fff !important; border: 1px solid #333 !important; border-radius: 4px !important; padding: 5px 20px 5px 18px !important; text-align: right !important; font-size: 10px !important; height: 24px !important; box-sizing: border-box !important; }
+    .oa-netpos-input { width: 70px !important; background: #111 !important; color: #fff !important; border: 1px solid #333 !important; border-radius: 4px !important; padding: 5px 20px 5px 18px !important; text-align: center !important; font-size: 10px !important; height: 24px !important; box-sizing: border-box !important; }
     .oa-netpos-label { position: absolute !important; left: 6px !important; top: 50% !important; transform: translateY(-50%) !important; color: #666 !important; font-size: 12px !important; font-weight: 700 !important; pointer-events: auto !important; }
     .oa-netpos-input.editable { border-color: #5c6bc0; background: #1a1a2e; }
     .oa-netpos-input[readonly] { cursor: pointer; }
